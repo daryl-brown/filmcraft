@@ -1,0 +1,115 @@
+name: bcm-windows-build
+
+# Unsigned Windows x64 portable build with speech-to-text (Cargo feature "whisper").
+# No secrets, no signing, no release publishing.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [bcm]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bcm-windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Toolchain pin: the workspace declares rust-version = "1.95" and ships no rust-toolchain file.
+  RUST_TOOLCHAIN: "1.95.0"
+  TARGET: x86_64-pc-windows-msvc
+  CARGO_TERM_COLOR: never
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $env:TARGET --no-self-update
+          rustup default $env:RUST_TOOLCHAIN
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $inPkg = $false
+          $v = $null
+          foreach ($line in Get-Content Cargo.toml) {
+            if ($line -match '^\s*\[') { $inPkg = ($line.Trim() -eq '[workspace.package]'); continue }
+            if ($inPkg -and $line -match '^\s*version\s*=\s*"([^"]+)"') { $v = $Matches[1]; break }
+          }
+          if (-not $v) { throw 'could not read [workspace.package] version from Cargo.toml' }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Output "version $v"
+
+      - name: Build (release, locked, whisper enabled)
+        shell: pwsh
+        env:
+          # Static CRT, as upstream packaging does, so no VC++ redistributable is needed.
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+          FILMCRAFT_REQUIRE_WINRES: "1"
+          FILMCRAFT_BUILD_SHA: ${{ github.sha }}
+        run: |
+          $env:FILMCRAFT_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
+          cargo build --release --locked -p filmcraft -p filmcraft-cli --features filmcraft/whisper,filmcraft-cli/whisper --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+
+      - name: Package portable zip and checksum
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          $bin = Join-Path 'target' "$env:TARGET\release"
+          $name = "filmcraft-$env:VERSION-bcm-windows-x64"
+          $stage = Join-Path 'dist' $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item (Join-Path $bin 'filmcraft.exe'), (Join-Path $bin 'filmcraft-cli.exe') $stage
+          # Marker that makes FilmCraft keep its data in .\data next to the exe.
+          Set-Content -Encoding ascii -Path (Join-Path $stage 'portable.txt') -Value @(
+            'FilmCraft portable: preferences, presets, logs and crash recovery are kept in the data folder',
+            'next to filmcraft.exe. Delete this file to use %APPDATA%\FilmCraft instead.'
+          )
+          foreach ($f in 'README.md', 'LICENSE', 'LICENSE-MIT', 'LICENSE-APACHE') {
+            if (Test-Path $f) { Copy-Item $f $stage }
+          }
+          $zip = Join-Path 'dist' "$name.zip"
+          Remove-Item -Force $zip -ErrorAction SilentlyContinue
+          Compress-Archive -Path $stage -DestinationPath $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash
+          Set-Content -Encoding ascii -Path (Join-Path 'dist' "$name.zip.sha256") -Value "$hash  $name.zip"
+          Get-Content (Join-Path 'dist' "$name.zip.sha256")
+          & (Join-Path $stage 'filmcraft-cli.exe') --version
+          if ($LASTEXITCODE -ne 0) { throw 'filmcraft-cli --version failed' }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: filmcraft-${{ steps.ver.outputs.version }}-bcm-windows-x64
+          path: |
+            dist/filmcraft-${{ steps.ver.outputs.version }}-bcm-windows-x64.zip
+            dist/filmcraft-${{ steps.ver.outputs.version }}-bcm-windows-x64.zip.sha256
+          retention-days: 14
+          if-no-files-found: error
