@@ -68,8 +68,8 @@ jobs:
       - name: Test FCP7 XML importer (debug, locked, no whisper)
         shell: pwsh
         run: |
-          cargo test --locked -p filmcraft-interchange --test it fcp7 --target $env:TARGET
-          if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
+          . ./.github/scripts/ci-logged.ps1
+          Invoke-Logged -Title 'cargo test fcp7' -Command { cargo test --locked -p filmcraft-interchange --test it fcp7 --target $env:TARGET --message-format short }
 
       - name: Install ffmpeg (bit-exactness oracle for the H.264 decoder tests)
         shell: pwsh
@@ -86,8 +86,8 @@ jobs:
           # A missing ffmpeg must fail the run, not skip the oracle tests.
           FILMCRAFT_REQUIRE_ORACLES: "1"
         run: |
-          cargo test --locked -p filmcraft-h264 --target $env:TARGET
-          if ($LASTEXITCODE -ne 0) { throw "cargo test -p filmcraft-h264 failed with exit code $LASTEXITCODE" }
+          . ./.github/scripts/ci-logged.ps1
+          Invoke-Logged -Title 'cargo test h264' -Command { cargo test --locked -p filmcraft-h264 --target $env:TARGET --message-format short }
 
       - name: Build (release, locked, whisper enabled)
         shell: pwsh
@@ -98,8 +98,8 @@ jobs:
           FILMCRAFT_BUILD_SHA: ${{ github.sha }}
         run: |
           $env:FILMCRAFT_BUILD_DATE = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd')
-          cargo build --release --locked -p filmcraft -p filmcraft-cli --features filmcraft/whisper,filmcraft-cli/whisper --target $env:TARGET
-          if ($LASTEXITCODE -ne 0) { throw "cargo build failed with exit code $LASTEXITCODE" }
+          . ./.github/scripts/ci-logged.ps1
+          Invoke-Logged -Title 'cargo build release' -Command { cargo build --release --locked -p filmcraft -p filmcraft-cli --features filmcraft/whisper,filmcraft-cli/whisper --target $env:TARGET --message-format short }
 
       - name: Package portable zip and checksum
         shell: pwsh
