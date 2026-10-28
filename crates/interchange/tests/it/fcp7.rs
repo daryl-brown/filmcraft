@@ -775,3 +775,38 @@ fn fcp7_export_start_fade_keeps_numeric_bounds() {
     let (_, xml, _) = roundtrip(&p, s, Format::Fcp7Xml, &ExportOptions::default());
     assert_eq!(clip_spans(&xml), vec![(698, 877, 5378, 5557)], "{xml}");
 }
+
+/// Premiere's own name and effect id for the audio crossfade are written, so it does not warn that the transition was
+/// not translated. Constant Gain (no Premiere id known) and video transitions keep their display names.
+#[test]
+fn fcp7_export_audio_constant_power_uses_premiere_id() {
+    let r = FrameRate::FPS_25;
+    let mut p = Project::new("P");
+    let a = media(&mut p, "/audio/music.wav", false, true, r);
+    let v = media(&mut p, "/video/shot.mov", true, false, r);
+    let s = sequence(&mut p, "S", r, false);
+    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698, 179, 5378);
+    transition(&mut p, s, TrackKind::Audio, 0, "constant_power", None, Some(c), 698, 62, TransitionAlign::StartAtCut);
+    let g = clip(&mut p, s, TrackKind::Audio, 1, a, 100, 100, 0);
+    transition(&mut p, s, TrackKind::Audio, 1, "constant_gain", None, Some(g), 100, 20, TransitionAlign::StartAtCut);
+    let vc = clip(&mut p, s, TrackKind::Video, 0, v, 0, 100, 0);
+    transition(&mut p, s, TrackKind::Video, 0, "cross_dissolve", None, Some(vc), 0, 20, TransitionAlign::StartAtCut);
+    let (bytes, _) = export(&p, s, Format::Fcp7Xml, &ExportOptions::default()).unwrap();
+    let xml = String::from_utf8(bytes).unwrap();
+    assert!(xml.contains("<name>Cross Fade (+3dB)</name>"), "{xml}");
+    assert!(xml.contains("<effectid>KGAudioTransCrossFade3dB</effectid>"), "{xml}");
+    assert!(!xml.contains("<name>Constant Power</name>"), "{xml}");
+    assert!(xml.contains("<name>Constant Gain</name>") && xml.contains("<effectid>Constant Gain</effectid>"), "{xml}");
+    assert!(xml.contains("<name>Cross Dissolve</name>") && xml.contains("<effectid>Cross Dissolve</effectid>"), "{xml}");
+}
+
+/// A Premiere audio crossfade survives import, export and re-import as Constant Power.
+#[test]
+fn fcp7_audio_crossfade_id_roundtrip_keeps_type() {
+    let (imp, _) = import(transition_bounded_audio_doc().as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let (again, xml, _) = roundtrip(&imp.project, only_seq(&imp), Format::Fcp7Xml, &ExportOptions::default());
+    assert_eq!(xml.matches("<effectid>KGAudioTransCrossFade3dB</effectid>").count(), 2, "{xml}");
+    let seq = again.project.sequence(only_seq(&again)).unwrap();
+    let kinds: Vec<_> = seq.audio_tracks[0].transitions.iter().map(|t| t.effect.effect.as_str()).collect();
+    assert_eq!(kinds, vec!["constant_power", "constant_power"]);
+}

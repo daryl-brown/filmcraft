@@ -981,9 +981,17 @@ impl Exp<'_, '_> {
         self.w.text("end", frames_round(rate, tr.end()));
         self.w.text("alignment", align);
         self.w.open("effect", &[]);
-        let name = transition_name(&tr.effect);
+        // Premiere names its audio crossfade "Cross Fade (+3dB)" with effect id KGAudioTransCrossFade3dB (the
+        // importer maps that name to Constant Power). Writing FilmCraft's own name makes Premiere warn that the
+        // transition was not translated. Other transitions keep the display name for both fields.
+        let (name, effect_id) = if kind == TrackKind::Audio && tr.effect.effect == "constant_power" {
+            ("Cross Fade (+3dB)".to_string(), "KGAudioTransCrossFade3dB".to_string())
+        } else {
+            let n = transition_name(&tr.effect);
+            (n.clone(), n)
+        };
         self.w.text("name", &name);
-        self.w.text("effectid", &name);
+        self.w.text("effectid", &effect_id);
         self.w.text("effectcategory", tr.effect.def().and_then(|d| d.category.get(1).copied()).unwrap_or("Dissolve"));
         self.w.text("effecttype", "transition");
         self.w.text("mediatype", if kind == TrackKind::Video { "video" } else { "audio" });
