@@ -259,24 +259,10 @@ fn golden_premiere_style_nested_and_transitions() {
     assert_eq!(s.markers[0].start, r.tick_of(30));
 }
 
+/// Both fades resolve the sentinel bounds of an imported audio clip.
 #[test]
 fn transition_bounded_audio_clip_keeps_both_transitions() {
-    let doc = r#"<xmeml version="4"><sequence id="sequence-1">
-      <name>Faded audio</name><duration>877</duration>
-      <rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate>
-      <media><audio><track>
-        <transitionitem><start>698</start><end>760</end><alignment>start-black</alignment>
-          <effect><name>Cross Fade (+3dB)</name><effectid>Cross Fade (+3dB)</effectid><mediatype>audio</mediatype></effect>
-        </transitionitem>
-        <clipitem id="clipitem-1"><name>music.wav</name>
-          <start>-1</start><end>-1</end><in>5378</in><out>5557</out>
-          <file id="file-1"><name>music.wav</name><pathurl>file:///audio/music.wav</pathurl></file>
-        </clipitem>
-        <transitionitem><start>820</start><end>877</end><alignment>end-black</alignment>
-          <effect><name>Cross Fade (+3dB)</name><effectid>Cross Fade (+3dB)</effectid><mediatype>audio</mediatype></effect>
-        </transitionitem>
-      </track></audio></media>
-    </sequence></xmeml>"#;
+    let doc = transition_bounded_audio_doc();
     let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
     let s = imp.project.sequence(imp.sequences[0]).unwrap();
     let track = &s.audio_tracks[0];
@@ -708,4 +694,84 @@ fn centred_mono_breakout_round_trips_centred() {
     }
     let (imp, xml, _) = roundtrip(&p, s, Format::Fcp7Xml, &ExportOptions::default());
     assert_eq!(balances(&imp), vec![0.0, 0.0], "{xml}");
+}
+
+/// The two-fade audio shape used by the importer and exporter regressions.
+fn transition_bounded_audio_doc() -> &'static str {
+    r#"<xmeml version="4"><sequence id="sequence-1">
+      <name>Faded audio</name><duration>877</duration>
+      <rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate>
+      <media><audio><track>
+        <transitionitem><start>698</start><end>760</end><alignment>start-black</alignment>
+          <effect><name>Cross Fade (+3dB)</name><effectid>Cross Fade (+3dB)</effectid><mediatype>audio</mediatype></effect>
+        </transitionitem>
+        <clipitem id="clipitem-1"><name>music.wav</name>
+          <start>-1</start><end>-1</end><in>5378</in><out>5557</out>
+          <file id="file-1"><name>music.wav</name><pathurl>file:///audio/music.wav</pathurl></file>
+        </clipitem>
+        <transitionitem><start>820</start><end>877</end><alignment>end-black</alignment>
+          <effect><name>Cross Fade (+3dB)</name><effectid>Cross Fade (+3dB)</effectid><mediatype>audio</mediatype></effect>
+        </transitionitem>
+      </track></audio></media>
+    </sequence></xmeml>"#
+}
+
+/// Export writes sentinel bounds without changing source spans or either fade.
+#[test]
+fn fcp7_export_transition_bounded_audio() {
+    let r = FrameRate::FPS_25;
+    let mut p = Project::new("P");
+    let a = media(&mut p, "/audio/music.wav", false, true, r);
+    let s = sequence(&mut p, "Faded audio", r, false);
+    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698, 179, 5378);
+    transition(&mut p, s, TrackKind::Audio, 0, "constant_power", None, Some(c), 698, 62, TransitionAlign::StartAtCut);
+    transition(&mut p, s, TrackKind::Audio, 0, "constant_power", Some(c), None, 820, 57, TransitionAlign::EndAtCut);
+    let (bytes, _) = export(&p, s, Format::Fcp7Xml, &ExportOptions::default()).unwrap();
+    let xml = String::from_utf8(bytes).unwrap();
+    assert_eq!(clip_spans(&xml), vec![(-1, -1, 5378, 5557)], "{xml}");
+    let fades: Vec<_> = xml.split("<transitionitem>").skip(1).map(|b| b.split("</transitionitem>").next().unwrap()).collect();
+    assert_eq!(fades.len(), 2, "{xml}");
+    for (fade, start, end) in [(fades[0], 698, 760), (fades[1], 820, 877)] {
+        assert!(fade.contains(&format!("<start>{start}</start>")), "{fade}");
+        assert!(fade.contains(&format!("<end>{end}</end>")), "{fade}");
+    }
+}
+
+/// Sentinel bounds survive import, export and a second import with both fades.
+#[test]
+fn fcp7_transition_bounded_audio_roundtrip() {
+    let (imp, _) = import(transition_bounded_audio_doc().as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let (again, xml, _) = roundtrip(&imp.project, only_seq(&imp), Format::Fcp7Xml, &ExportOptions::default());
+    assert_eq!(clip_spans(&xml), vec![(-1, -1, 5378, 5557)], "{xml}");
+    let seq = again.project.sequence(only_seq(&again)).unwrap();
+    let track = &seq.audio_tracks[0];
+    let r = FrameRate::FPS_25;
+    assert_eq!(track.items.len(), 1);
+    assert_eq!((track.items[0].start, track.items[0].duration), (r.tick_of(698), r.tick_of(179)));
+    assert_eq!(track.transitions.len(), 2);
+}
+
+/// A clip without transitions retains numeric record bounds.
+#[test]
+fn fcp7_export_unbounded_audio_keeps_numeric_bounds() {
+    let r = FrameRate::FPS_25;
+    let mut p = Project::new("P");
+    let a = media(&mut p, "/audio/music.wav", false, true, r);
+    let s = sequence(&mut p, "S", r, false);
+    clip(&mut p, s, TrackKind::Audio, 0, a, 698, 179, 5378);
+    let (_, xml, _) = roundtrip(&p, s, Format::Fcp7Xml, &ExportOptions::default());
+    assert_eq!(clip_spans(&xml), vec![(698, 877, 5378, 5557)], "{xml}");
+}
+
+/// A start fade alone retains numeric bounds at both edges.
+#[test]
+fn fcp7_export_start_fade_keeps_numeric_bounds() {
+    let r = FrameRate::FPS_25;
+    let mut p = Project::new("P");
+    let a = media(&mut p, "/audio/music.wav", false, true, r);
+    let s = sequence(&mut p, "S", r, false);
+    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698, 179, 5378);
+    transition(&mut p, s, TrackKind::Audio, 0, "constant_power", None, Some(c), 698, 62, TransitionAlign::StartAtCut);
+    let (_, xml, _) = roundtrip(&p, s, Format::Fcp7Xml, &ExportOptions::default());
+    assert_eq!(clip_spans(&xml), vec![(698, 877, 5378, 5557)], "{xml}");
 }

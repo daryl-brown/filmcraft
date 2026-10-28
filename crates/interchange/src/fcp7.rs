@@ -925,7 +925,7 @@ impl Exp<'_, '_> {
                 let mut order: Vec<(Tick, u8, usize)> = t.items.iter().enumerate().map(|(i, c)| (c.start, 1, i)).collect();
                 order.extend(t.transitions.iter().enumerate().map(|(i, tr)| (tr.start, 0, i)));
                 order.sort();
-                for (_, k, i) in order {
+                for (pos, &(_, k, i)) in order.iter().enumerate() {
                     if k == 1 {
                         let c = &t.items[i];
                         let links: Vec<(String, TrackKind, usize, usize)> = c
@@ -934,7 +934,18 @@ impl Exp<'_, '_> {
                             .map(|m| m.iter().filter_map(|id| clip_xml.get(id).cloned()).collect())
                             .unwrap_or_default();
                         let xid = clip_xml[&c.id].0.clone();
-                        self.write_clip(c, kind, seq, &xid, &links);
+                        let transition_bounded = pos
+                            .checked_sub(1)
+                            .and_then(|prev| order.get(prev))
+                            .filter(|(_, k, _)| *k == 0)
+                            .and_then(|(_, _, i)| t.transitions.get(*i))
+                            .is_some_and(|tr| frames_round(rate, tr.start) == frames_round(rate, c.start))
+                            && order
+                                .get(pos.saturating_add(1))
+                                .filter(|(_, k, _)| *k == 0)
+                                .and_then(|(_, _, i)| t.transitions.get(*i))
+                                .is_some_and(|tr| frames_round(rate, tr.end()) == frames_round(rate, c.end()));
+                        self.write_clip(c, kind, seq, &xid, &links, transition_bounded);
                     } else {
                         self.write_transition(&t.transitions[i], kind, rate, t);
                     }
@@ -1036,7 +1047,7 @@ impl Exp<'_, '_> {
         }
     }
 
-    fn write_clip(&mut self, c: &TrackItem, kind: TrackKind, seq: &Sequence, xid: &str, links: &[(String, TrackKind, usize, usize)]) {
+    fn write_clip(&mut self, c: &TrackItem, kind: TrackKind, seq: &Sequence, xid: &str, links: &[(String, TrackKind, usize, usize)], transition_bounded: bool) {
         let rate = seq.settings.frame_rate;
         if !on_frame(rate, c.start) || !on_frame(rate, c.duration) {
             self.report.warn("sub-frame clip positions were rounded to frames");
@@ -1066,8 +1077,8 @@ impl Exp<'_, '_> {
         let media_dur = self.p.item(base).map(|i| i.duration()).unwrap_or(Tick::ZERO).max(src_out);
         self.w.text("duration", frames_round(rate, media_dur).max(out_f));
         write_rate(&mut self.w, rate);
-        self.w.text("start", start_f);
-        self.w.text("end", end_f);
+        self.w.text("start", if transition_bounded { -1 } else { start_f });
+        self.w.text("end", if transition_bounded { -1 } else { end_f });
         self.w.text("in", in_f);
         self.w.text("out", out_f);
         self.w.text("pproTicksIn", src_in.0);
