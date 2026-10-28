@@ -372,7 +372,19 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         for c in elements(tn) {
             match c.tag_name().name() {
                 "clipitem" | "generatoritem" => {
-                    if let Some((ti_item, refs)) = self.clip_item(c, kind, rate, frame) {
+                    let transition_bounds = if child_i64(c, "start") == Some(-1) && child_i64(c, "end") == Some(-1) {
+                        let preceding = std::iter::successors(c.prev_sibling(), |n| n.prev_sibling())
+                            .find(|n| matches!(n.tag_name().name(), "transitionitem" | "clipitem" | "generatoritem"));
+                        let following = std::iter::successors(c.next_sibling(), |n| n.next_sibling())
+                            .find(|n| matches!(n.tag_name().name(), "transitionitem" | "clipitem" | "generatoritem"));
+                        (
+                            preceding.filter(|n| n.has_tag_name("transitionitem")).and_then(|n| child_i64(n, "start")),
+                            following.filter(|n| n.has_tag_name("transitionitem")).and_then(|n| child_i64(n, "end")),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    if let Some((ti_item, refs)) = self.clip_item(c, kind, rate, frame, transition_bounds) {
                         let xml_id = node_key(c);
                         self.xml_clip_ids.insert((seq_id, xml_id), ti_item.id);
                         if !refs.is_empty() {
@@ -399,7 +411,9 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         }
     }
 
-    fn clip_item(&mut self, c: Node<'a, 'i>, kind: TrackKind, seq_rate: FrameRate, frame: (u32, u32)) -> Option<(TrackItem, Vec<String>)> {
+    fn clip_item(
+        &mut self, c: Node<'a, 'i>, kind: TrackKind, seq_rate: FrameRate, frame: (u32, u32), transition_bounds: (Option<i64>, Option<i64>),
+    ) -> Option<(TrackItem, Vec<String>)> {
         let name = child_text(c, "name").unwrap_or("").to_string();
         let rate = read_rate(c).unwrap_or(seq_rate);
         let item = if c.has_tag_name("generatoritem") {
@@ -444,6 +458,11 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
 
         let start = child_i64(c, "start").unwrap_or(-1);
         let end = child_i64(c, "end").unwrap_or(-1);
+        let (start, end) = if start == -1 && end == -1 {
+            (transition_bounds.0.unwrap_or(start), transition_bounds.1.unwrap_or(end))
+        } else {
+            (start, end)
+        };
         let in_f = child_i64(c, "in").unwrap_or(0);
         let out_f = child_i64(c, "out").unwrap_or(in_f);
         let src_in = child_i64(c, "pproTicksIn").map(Tick).unwrap_or_else(|| rate.tick_of(in_f));

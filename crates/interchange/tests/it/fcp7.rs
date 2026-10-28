@@ -259,6 +259,52 @@ fn golden_premiere_style_nested_and_transitions() {
     assert_eq!(s.markers[0].start, r.tick_of(30));
 }
 
+#[test]
+fn transition_bounded_audio_clip_keeps_both_transitions() {
+    let doc = r#"<xmeml version="4"><sequence id="sequence-1">
+      <name>Faded audio</name><duration>877</duration>
+      <rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate>
+      <media><audio><track>
+        <transitionitem><start>698</start><end>760</end><alignment>start-black</alignment>
+          <effect><name>Cross Fade (+3dB)</name><effectid>Cross Fade (+3dB)</effectid><mediatype>audio</mediatype></effect>
+        </transitionitem>
+        <clipitem id="clipitem-1"><name>music.wav</name>
+          <start>-1</start><end>-1</end><in>5378</in><out>5557</out>
+          <file id="file-1"><name>music.wav</name><pathurl>file:///audio/music.wav</pathurl></file>
+        </clipitem>
+        <transitionitem><start>820</start><end>877</end><alignment>end-black</alignment>
+          <effect><name>Cross Fade (+3dB)</name><effectid>Cross Fade (+3dB)</effectid><mediatype>audio</mediatype></effect>
+        </transitionitem>
+      </track></audio></media>
+    </sequence></xmeml>"#;
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let s = imp.project.sequence(imp.sequences[0]).unwrap();
+    let track = &s.audio_tracks[0];
+    let r = FrameRate::FPS_25;
+    assert_eq!(track.items.len(), 1);
+    assert_eq!(track.items[0].start, r.tick_of(698));
+    assert_eq!(track.items[0].duration, r.tick_of(179));
+    assert_eq!(track.transitions.len(), 2);
+    assert!(!rep.mentions("neither start nor end"), "{rep}");
+}
+
+#[test]
+fn audio_clip_without_bounds_or_transitions_is_still_skipped() {
+    let doc = r#"<xmeml version="4"><sequence id="sequence-1">
+      <name>Unbounded audio</name><rate><timebase>25</timebase><ntsc>FALSE</ntsc></rate>
+      <media><audio><track>
+        <clipitem id="clipitem-1"><name>music.wav</name>
+          <start>-1</start><end>-1</end><in>5378</in><out>5557</out>
+          <file id="file-1"><name>music.wav</name><pathurl>file:///audio/music.wav</pathurl></file>
+        </clipitem>
+      </track></audio></media>
+    </sequence></xmeml>"#;
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let s = imp.project.sequence(imp.sequences[0]).unwrap();
+    assert!(s.audio_tracks[0].items.is_empty());
+    assert!(rep.mentions("clip \"music.wav\" has neither start nor end; skipped"), "{rep}");
+}
+
 fn rich_project() -> (Project, filmcraft_project::ItemId) {
     let r = FrameRate::FPS_29_97;
     let mut p = Project::new("P");
