@@ -810,3 +810,209 @@ fn fcp7_audio_crossfade_id_roundtrip_keeps_type() {
     let kinds: Vec<_> = seq.audio_tracks[0].transitions.iter().map(|t| t.effect.effect.as_str()).collect();
     assert_eq!(kinds, vec!["constant_power", "constant_power"]);
 }
+
+
+fn slider_doc(kind: &str, filters: &[String]) -> String {
+    let clips: String = filters.iter().enumerate().map(|(i, filter)| format!(r#"
+        <clipitem id="clip-{i}"><name>sliders</name><rate><timebase>25</timebase></rate>
+        <start>{}</start><end>{}</end><in>6145</in><out>6170</out>
+        <file id="file-{i}"><name>sliders.mov</name><pathurl>file:///sliders.mov</pathurl>
+        <duration>7000</duration><rate><timebase>25</timebase></rate><media>
+        <video><samplecharacteristics><width>1920</width><height>1080</height></samplecharacteristics></video>
+        <audio><channelcount>1</channelcount><samplecharacteristics><samplerate>48000</samplerate></samplecharacteristics></audio>
+        </media></file>{filter}</clipitem>"#, i * 25, (i + 1) * 25)).collect();
+    format!(r#"<xmeml version="4"><sequence><name>Sliders</name><duration>{}</duration>
+        <rate><timebase>25</timebase></rate><media><{kind}><track>{clips}</track></{kind}></media>
+        </sequence></xmeml>"#, filters.len() * 25)
+}
+
+fn slider_parameter(id: &str, value: &str) -> String {
+    format!("<parameter><parameterid>{id}</parameterid><value>{value}</value></parameter>")
+}
+
+fn lumetri_filter(params: &str) -> String {
+    format!("<filter><effect><name /><effectid>Lumetri</effectid><pproBypass>false</pproBypass>{params}</effect></filter>")
+}
+
+fn gain_filter(value: &str, enabled: bool) -> String {
+    format!("<filter><enabled>{enabled}</enabled><effect><name>Gain</name><effectid>{{61756678, 4761696e, 4b657947}}</effectid>{}</effect></filter>", slider_parameter("Gain(dB)", value))
+}
+
+fn audio_levels(animated: bool) -> String {
+    let param = if animated {
+        "<parameter><parameterid>level</parameterid><value>3.28024</value><keyframe><when>6148</when><value>2.00668</value></keyframe><keyframe><when>6172</when><value>3.28024</value></keyframe></parameter>".to_string()
+    } else {
+        slider_parameter("level", "1.0")
+    };
+    format!("<filter><effect><effectid>audiolevels</effectid>{param}</effect></filter>")
+}
+
+/// Clip gain leaves trimmed Audio Levels automation unchanged.
+#[test]
+fn premiere_gain_preserves_keyframes() {
+    let doc = slider_doc("audio", &[gain_filter("2", true) + &audio_levels(true), audio_levels(true)]);
+    let (imp, _) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let clips = &imp.project.sequence(only_seq(&imp)).unwrap().audio_tracks[0].items;
+    assert_eq!(clips[0].gain_db, 2.0);
+    let level = |i: usize| clips[i].effect("volume").unwrap().param("level").unwrap();
+    assert_eq!(level(0), level(1));
+    assert_eq!(level(0).keyframes.len(), 2);
+}
+
+/// Gain is folded once into Audio Levels and stays stable over two cycles.
+#[test]
+fn premiere_gain_round_trip() {
+    let doc = slider_doc("audio", &[gain_filter("2", true) + &audio_levels(false)]);
+    let (mut imp, _) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let clip = &imp.project.sequence(only_seq(&imp)).unwrap().audio_tracks[0].items[0];
+    assert_eq!(clip.gain_db, 2.0);
+    assert_eq!(clip.effect("volume").unwrap().param("level").unwrap().value, ParamValue::Float(0.0));
+    for _ in 0..2 {
+        let (bytes, _) = export(&imp.project, only_seq(&imp), Format::Fcp7Xml, &ExportOptions::default()).unwrap();
+        let xml = std::str::from_utf8(&bytes).unwrap();
+        assert!(!xml.contains("<name>Gain</name>"));
+        let parsed = roxmltree::Document::parse(xml).unwrap();
+        let amplitude: f64 = parsed.descendants().find(|n| n.has_tag_name("parameter") && n.children().any(|c| c.has_tag_name("parameterid") && c.text() == Some("level")))
+            .unwrap().children().find(|n| n.has_tag_name("value")).unwrap().text().unwrap().parse().unwrap();
+        assert!((amplitude - 10.0_f64.powf(2.0 / 20.0)).abs() < 1e-6);
+        imp = import(&bytes, Format::Fcp7Xml, None).unwrap().0;
+        let clip = &imp.project.sequence(only_seq(&imp)).unwrap().audio_tracks[0].items[0];
+        assert_eq!(clip.gain_db, 0.0);
+        assert!((clip.effect("volume").unwrap().param("level").unwrap().value.as_f64().unwrap() - 2.0).abs() < 1e-6);
+    }
+}
+
+/// Disabled Gain does not change clip gain.
+#[test]
+fn premiere_gain_disabled() {
+    let doc = slider_doc("audio", &[gain_filter("2", false)]);
+    let (imp, _) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    assert_eq!(imp.project.sequence(only_seq(&imp)).unwrap().audio_tracks[0].items[0].gain_db, 0.0);
+}
+
+/// Numeric Premiere ids distinguish the two Saturation controls.
+#[test]
+fn premiere_lumetri_values() {
+    let a = slider_parameter("11", "-91445760000000000,1.255506992340087890625,0,0,0,0,0,0")
+        + &slider_parameter("12", "-91445760000000000,18.94272613525390625,0,0,0,0,0,0")
+        + &slider_parameter("29", "0.") + &slider_parameter("4", "");
+    let b = slider_parameter("20", "-91445760000000000,117.687,0,0,0,0,0,0")
+        + &slider_parameter("31", "100.") + &slider_parameter("51", "0.") + &slider_parameter("52", "50.");
+    let doc = slider_doc("video", &[lumetri_filter(&a), lumetri_filter(&b)]);
+    let (imp, _) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let clips = &imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items;
+    let a = clips[0].effect("lumetri").unwrap();
+    let b = clips[1].effect("lumetri").unwrap();
+    assert_eq!(a.param("exposure").unwrap().value, ParamValue::Float(1.255506992340087890625));
+    assert_eq!(a.param("contrast").unwrap().value, ParamValue::Float(18.94272613525390625));
+    for (id, value) in [("saturation", 117.687), ("creative_sat", 100.0), ("vignette_amount", 0.0), ("vignette_midpoint", 50.0)] {
+        assert_eq!(b.param(id).unwrap().value, ParamValue::Float(value));
+    }
+    for id in ["basic_on", "creative_on", "curves_on", "wheels_on", "vignette_on"] {
+        assert_eq!(b.param(id).unwrap().value, ParamValue::Bool(true));
+    }
+}
+
+/// Default sliders and neutral unmapped values preserve registry defaults.
+#[test]
+fn premiere_lumetri_defaults() {
+    let mut params = String::new();
+    for id in ["7", "8", "11", "12", "13", "14", "15", "16", "28", "30", "51", "53", "29", "33"] {
+        params += &slider_parameter(id, "-91445760000000000,0.,0,0,0,0,0,0");
+    }
+    for id in ["20", "26", "31"] { params += &slider_parameter(id, "100."); }
+    for id in ["52", "54"] { params += &slider_parameter(id, "50."); }
+    for id in ["3", "23", "37", "46", "50"] { params += &slider_parameter(id, "-91445760000000000,true,0,0,0,0,0,0"); }
+    params += &slider_parameter("24", "false");
+    let doc = slider_doc("video", &[lumetri_filter(&params)]);
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let effect = imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items[0].effect("lumetri").unwrap();
+    assert_eq!(effect.params, filmcraft_project::find_effect("lumetri").unwrap().instance().params);
+    assert!(!rep.mentions("not imported"), "{rep}");
+}
+
+/// Invalid tuples warn without replacing the default exposure.
+#[test]
+fn premiere_lumetri_bad_tuple() {
+    let doc = slider_doc("video", &[lumetri_filter(&slider_parameter("11", "-91445760000000000,abc,0,0,0,0,0,0"))]);
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    assert_eq!(imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items[0].effect("lumetri").unwrap().param("exposure").unwrap().value, ParamValue::Float(0.0));
+    assert!(rep.mentions("Lumetri: parameter 11 value not read; skipped"));
+    assert!(rep.mentions("Lumetri: 1 parameter not imported"));
+}
+
+/// Unmapped data produces one summary for each filter.
+#[test]
+fn premiere_lumetri_unmapped_data() {
+    let params = slider_parameter("29", "-91445760000000000,35.,0,0,0,0,0,0") + &slider_parameter("39", "YWJjZGVmZ2hpamtsbW5vcA==");
+    let doc = slider_doc("video", &[lumetri_filter(&params)]);
+    let (_, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let warnings: Vec<_> = rep.warnings().filter(|e| e.message.starts_with("Lumetri:")).collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0].message, "Lumetri: 2 parameters not imported");
+    assert_eq!(warnings[0].count, 1);
+}
+
+/// An empty Premiere name still resolves Lumetri.
+#[test]
+fn premiere_lumetri_empty_name() {
+    let doc = slider_doc("video", &[lumetri_filter("")]);
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    assert!(imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items[0].effect("lumetri").is_some());
+    assert!(!rep.mentions("effect \"\" is not supported"));
+}
+
+/// Unknown ids with empty names remain unsupported.
+#[test]
+fn premiere_lumetri_lookup_negative_control() {
+    let doc = slider_doc("video", &["<filter><effect><name /><effectid>NoSuchEffectXyz</effectid></effect></filter>".into()]);
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    assert!(imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items[0].effect("lumetri").is_none());
+    assert!(rep.mentions("effect \"NoSuchEffectXyz\" is not supported"));
+}
+
+
+/// Repeated Gain filters add, clamp and warn on invalid values.
+#[test]
+fn premiere_gain_additive_and_invalid() {
+    let fallback = gain_filter("-91445760000000000,3.,0,0,0,0,0,0", true).replace("{61756678, 4761696e, 4b657947}", "alternate").replace("<name>Gain</name>", "<name>gAiN</name>");
+    let filters = gain_filter("2", true) + &fallback + &gain_filter("abc", true);
+    let doc = slider_doc("audio", &[filters, gain_filter("95", true) + &gain_filter("5", true), gain_filter("-95", true) + &gain_filter("-5", true)]);
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    let clips = &imp.project.sequence(only_seq(&imp)).unwrap().audio_tracks[0].items;
+    assert_eq!(clips[0].gain_db, 5.0);
+    assert_eq!(clips[1].gain_db, 96.0);
+    assert_eq!(clips[2].gain_db, -96.0);
+    assert!(rep.mentions("Gain: value not read; skipped"));
+}
+
+/// Keyframes and malformed tuples count once while bypass disables the effect.
+#[test]
+fn premiere_lumetri_keyframes_and_bypass() {
+    let params = "<parameter><parameterid>11</parameterid><value>2.</value><keyframe><when>6148</when><value>3.</value></keyframe></parameter>".to_string()
+        + &slider_parameter("12", "0,2") + &slider_parameter("unknown", "true") + &slider_parameter("7", "NaN");
+    let bypass = lumetri_filter(&params).replace("<pproBypass>false", "<pproBypass>true");
+    let disabled = lumetri_filter("").replace("<filter>", "<filter><enabled>false</enabled>");
+    let doc = slider_doc("video", &[bypass, disabled]);
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    for clip in &imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items {
+        let effect = clip.effect("lumetri").unwrap();
+        assert!(!effect.enabled);
+        assert_eq!(effect.param("exposure").unwrap().value, ParamValue::Float(0.0));
+    }
+    assert!(rep.mentions("Lumetri: 3 parameters not imported"));
+    assert!(rep.mentions("Lumetri: parameter 12 value not read; skipped"));
+    assert!(!rep.mentions("Lumetri: parameter 11 value not read"));
+}
+
+/// Generic lookup accepts case variants and display ids with empty names.
+#[test]
+fn premiere_lumetri_generic_lookup() {
+    for id in ["GAUSSIAN_BLUR", "Gaussian Blur"] {
+        let filter = format!("<filter><effect><name /><effectid>{id}</effectid></effect></filter>");
+        let doc = slider_doc("video", &[filter]);
+        let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+        assert!(imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items[0].effect("gaussian_blur").is_some());
+        assert!(!rep.mentions("is not supported"));
+    }
+}

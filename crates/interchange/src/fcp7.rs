@@ -578,7 +578,7 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
         let Some(e) = child(f, "effect") else { return };
         let enabled = child_bool(f, "enabled").unwrap_or(true);
         let id = child_text(e, "effectid").unwrap_or("");
-        let name = child_text(e, "name").unwrap_or(id);
+        let name = child_text(e, "name").filter(|n| !n.is_empty()).unwrap_or(id);
         let params: Vec<Node> = children(e, "parameter").collect();
         let find = |pid: &str| {
             params.iter().copied().find(|p| child_text(*p, "parameterid") == Some(pid) || child_text(*p, "name").is_some_and(|n| n.eq_ignore_ascii_case(pid)))
@@ -628,8 +628,94 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
                     set_param(ti, "panner", "balance", read_param(p, rate, |v| v * 100.0));
                 }
             }
+            _ if id == "{61756678, 4761696e, 4b657947}"
+                || (name.eq_ignore_ascii_case("Gain") && params.iter().any(|p| child_text(*p, "parameterid") == Some("Gain(dB)"))) =>
+            {
+                if !enabled {
+                    return;
+                }
+                let value = params.iter().copied().find(|p| child_text(*p, "parameterid") == Some("Gain(dB)")).and_then(|p| {
+                    if child_text(p, "value").is_some_and(|v| v.contains(',')) {
+                        premiere_scalar(child_text(p, "value")?).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
+                    } else {
+                        child_f64(p, "value").filter(|v| v.is_finite())
+                    }
+                });
+                if let Some(value) = value {
+                    ti.gain_db = (ti.gain_db + value).clamp(-96.0, 96.0);
+                } else {
+                    self.report.warn("Gain: value not read; skipped");
+                }
+            }
+            "Lumetri" => {
+                let Some(def) = filmcraft_project::find_effect("lumetri") else { return };
+                let mut inst = def.instance();
+                inst.enabled = enabled && !child_bool(e, "pproBypass").unwrap_or(false);
+                let mut omitted = 0usize;
+                for p in &params {
+                    let pid = child_text(*p, "parameterid").unwrap_or("");
+                    if children(*p, "keyframe").next().is_some() {
+                        omitted += 1;
+                        continue;
+                    }
+                    let target = match pid {
+                        "3" => Some(("basic_on", true)),
+                        "7" => Some(("temperature", false)),
+                        "8" => Some(("tint", false)),
+                        "11" => Some(("exposure", false)),
+                        "12" => Some(("contrast", false)),
+                        "13" => Some(("highlights", false)),
+                        "14" => Some(("shadows", false)),
+                        "15" => Some(("whites", false)),
+                        "16" => Some(("blacks", false)),
+                        "20" => Some(("saturation", false)),
+                        "23" => Some(("creative_on", true)),
+                        "26" => Some(("look_intensity", false)),
+                        "28" => Some(("faded_film", false)),
+                        "30" => Some(("vibrance", false)),
+                        "31" => Some(("creative_sat", false)),
+                        "37" => Some(("curves_on", true)),
+                        "46" => Some(("wheels_on", true)),
+                        "50" => Some(("vignette_on", true)),
+                        "51" => Some(("vignette_amount", false)),
+                        "52" => Some(("vignette_midpoint", false)),
+                        "53" => Some(("vignette_roundness", false)),
+                        "54" => Some(("vignette_feather", false)),
+                        _ => None,
+                    };
+                    let text = child_text(*p, "value").unwrap_or("").trim();
+                    let scalar = premiere_scalar(text);
+                    let Some((target, boolean)) = target else {
+                        let neutral = scalar.is_some_and(|v| matches!(v, "true" | "false") || v.parse::<f64>().is_ok_and(|v| v == 0.0));
+                        if !text.is_empty() && !neutral {
+                            omitted += 1;
+                        }
+                        continue;
+                    };
+                    let value = scalar.and_then(|v| {
+                        if boolean {
+                            v.parse::<bool>().ok().map(ParamValue::Bool)
+                        } else {
+                            v.parse::<f64>().ok().filter(|v| v.is_finite()).map(ParamValue::Float)
+                        }
+                    });
+                    if let Some(value) = value {
+                        inst.params.insert(target.to_string(), Param::new(value));
+                    } else {
+                        omitted += 1;
+                        self.report.warn(format!("Lumetri: parameter {pid} value not read; skipped"));
+                    }
+                }
+                if omitted > 0 {
+                    let noun = if omitted == 1 { "parameter" } else { "parameters" };
+                    self.report.warn(format!("Lumetri: {omitted} {noun} not imported"));
+                }
+                ti.effects.push(inst);
+            }
             _ => {
-                let def = filmcraft_project::find_effect(id).filter(|d| !d.intrinsic).or_else(|| find_effect_by_name(name).filter(|d| !d.intrinsic));
+                let def = filmcraft_project::find_effect(id).filter(|d| !d.intrinsic)
+                    .or_else(|| find_effect_by_name(id).filter(|d| !d.intrinsic))
+                    .or_else(|| find_effect_by_name(name).filter(|d| !d.intrinsic));
                 let Some(def) = def else {
                     self.report.warn(format!("effect \"{name}\" is not supported and was skipped"));
                     return;
@@ -733,6 +819,22 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
 fn read_color(v: Node) -> [f32; 4] {
     let c = |n: &str, d: f64| (child_f64(v, n).unwrap_or(d) / 255.0) as f32;
     [c("red", 0.0), c("green", 0.0), c("blue", 0.0), c("alpha", 255.0)]
+}
+
+/// Read a plain scalar or the value field of Premiere's eight-field tuple.
+fn premiere_scalar(text: &str) -> Option<&str> {
+    if text.contains(',') {
+        let mut fields = text.split(',');
+        fields.next()?;
+        let value = fields.next()?.trim();
+        if fields.count() != 6 || value.is_empty() {
+            return None;
+        }
+        Some(value)
+    } else {
+        let value = text.trim();
+        (!value.is_empty()).then_some(value)
+    }
 }
 
 fn read_param(p: Node, rate: FrameRate, map: impl Fn(f64) -> f64) -> Param {
