@@ -1005,7 +1005,8 @@ fn premiere_lumetri_keyframes_and_bypass() {
     assert!(!rep.mentions("Lumetri: parameter 11 value not read"));
 }
 
-/// Generic lookup accepts case variants and display ids with empty names.
+/// An empty name falls back to the effectid, so the existing name lookup resolves it. A non-empty name that
+/// matches nothing is not rescued by the effectid: the effect is still skipped, as before.
 #[test]
 fn premiere_lumetri_generic_lookup() {
     for id in ["GAUSSIAN_BLUR", "Gaussian Blur"] {
@@ -1015,4 +1016,9 @@ fn premiere_lumetri_generic_lookup() {
         assert!(imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items[0].effect("gaussian_blur").is_some());
         assert!(!rep.mentions("is not supported"));
     }
+    let filter = "<filter><effect><name>Mystery Glow</name><effectid>GAUSSIAN_BLUR</effectid></effect></filter>".to_string();
+    let doc = slider_doc("video", &[filter]);
+    let (imp, rep) = import(doc.as_bytes(), Format::Fcp7Xml, None).unwrap();
+    assert!(imp.project.sequence(only_seq(&imp)).unwrap().video_tracks[0].items[0].effect("gaussian_blur").is_none());
+    assert!(rep.mentions("effect \"Mystery Glow\" is not supported"), "{rep}");
 }

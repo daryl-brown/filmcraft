@@ -714,7 +714,6 @@ impl<'a, 'i> Imp<'a, 'i, '_> {
             }
             _ => {
                 let def = filmcraft_project::find_effect(id).filter(|d| !d.intrinsic)
-                    .or_else(|| find_effect_by_name(id).filter(|d| !d.intrinsic))
                     .or_else(|| find_effect_by_name(name).filter(|d| !d.intrinsic));
                 let Some(def) = def else {
                     self.report.warn(format!("effect \"{name}\" is not supported and was skipped"));
