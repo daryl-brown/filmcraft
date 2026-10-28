@@ -1,6 +1,7 @@
 //! Scaling (dequantisation) and inverse transforms (8.5.10 - 8.5.13).
 
 use crate::params::ScalingMatrices;
+use crate::picture::Sample;
 use crate::tables::{norm_adjust4, norm_adjust8};
 
 /// LevelScale4x4 / LevelScale8x8 for all six scaling lists and qP % 6, raster order.
@@ -48,22 +49,22 @@ pub fn luma_dc_dequant(c: &mut [i32; 16], qp: i32, ls00: i32) {
     // rows
     for i in 0..4 {
         let r = &c[i * 4..i * 4 + 4];
-        let s01 = r[0] + r[1];
-        let d01 = r[0] - r[1];
-        let s23 = r[2] + r[3];
-        let d23 = r[2] - r[3];
-        t[i * 4] = s01 + s23;
-        t[i * 4 + 1] = s01 - s23;
-        t[i * 4 + 2] = d01 - d23;
-        t[i * 4 + 3] = d01 + d23;
+        let s01 = r[0].wrapping_add(r[1]);
+        let d01 = r[0].wrapping_sub(r[1]);
+        let s23 = r[2].wrapping_add(r[3]);
+        let d23 = r[2].wrapping_sub(r[3]);
+        t[i * 4] = s01.wrapping_add(s23);
+        t[i * 4 + 1] = s01.wrapping_sub(s23);
+        t[i * 4 + 2] = d01.wrapping_sub(d23);
+        t[i * 4 + 3] = d01.wrapping_add(d23);
     }
     // columns
     for j in 0..4 {
-        let s01 = t[j] + t[4 + j];
-        let d01 = t[j] - t[4 + j];
-        let s23 = t[8 + j] + t[12 + j];
-        let d23 = t[8 + j] - t[12 + j];
-        let f = [s01 + s23, s01 - s23, d01 - d23, d01 + d23];
+        let s01 = t[j].wrapping_add(t[4 + j]);
+        let d01 = t[j].wrapping_sub(t[4 + j]);
+        let s23 = t[8 + j].wrapping_add(t[12 + j]);
+        let d23 = t[8 + j].wrapping_sub(t[12 + j]);
+        let f = [s01.wrapping_add(s23), s01.wrapping_sub(s23), d01.wrapping_sub(d23), d01.wrapping_add(d23)];
         for i in 0..4 {
             c[i * 4 + j] =
                 if qp >= 36 { f[i].wrapping_mul(ls00) << (qp / 6 - 6) } else { f[i].wrapping_mul(ls00).wrapping_add(1 << (5 - qp / 6)) >> (6 - qp / 6) };
@@ -83,81 +84,105 @@ pub fn chroma_dc_dequant_420(c: &mut [i32; 4], qp: i32, ls00: i32) {
     }
 }
 
+/// 4:2:2 chroma DC inverse scan, 2x4 Hadamard and scaling (8.5.11).
+/// `qp` is QP'C; `ls00` uses (QP'C + 3) % 6. Output is raster block order.
+pub fn chroma_dc_dequant_422(c: &mut [i32; 8], qp: i32, ls00: i32) {
+    let scan = [0, 2, 1, 5, 3, 6, 4, 7];
+    let mut t = [[0i32; 2]; 4];
+    for (r, row) in t.iter_mut().enumerate() {
+        let a = c[scan[2 * r]];
+        let b = c[scan[2 * r + 1]];
+        *row = [a.wrapping_add(b), a.wrapping_sub(b)];
+    }
+    let qpdc = qp + 3;
+    for col in 0..2 {
+        let a = t[0][col].wrapping_add(t[1][col]);
+        let b = t[0][col].wrapping_sub(t[1][col]);
+        let d = t[2][col].wrapping_add(t[3][col]);
+        let e = t[2][col].wrapping_sub(t[3][col]);
+        let f = [a.wrapping_add(d), a.wrapping_sub(d), b.wrapping_sub(e), b.wrapping_add(e)];
+        for (r, &v) in f.iter().enumerate() {
+            c[r * 2 + col] = scale8(v, ls00, qpdc);
+        }
+    }
+}
+
 #[inline(always)]
-fn clip_u8(v: i32) -> u8 {
-    v.clamp(0, 255) as u8
+fn clip<S: Sample>(v: i32, max_val: i32) -> S {
+    S::from_i32(v.clamp(0, max_val))
 }
 
 /// Inverse 4x4 transform of raster-order `d` and add to `dst` (8.5.12.2, 8.5.14).
 ///
 /// Rows first, then columns (the spec's order: the `>> 1` steps make it matter). The column
 /// pass and the reconstruction run across all columns at once so they vectorise.
-pub fn idct4_add(d: &[i32; 16], dst: &mut [u8], stride: usize) {
+pub fn idct4_add<S: Sample>(d: &[i32; 16], dst: &mut [S], stride: usize, max_val: i32) {
     let mut t = [[0i32; 4]; 4];
     for (i, row) in t.iter_mut().enumerate() {
         let r = &d[i * 4..i * 4 + 4];
-        let e = r[0] + r[2];
-        let f = r[0] - r[2];
-        let g = (r[1] >> 1) - r[3];
-        let h = r[1] + (r[3] >> 1);
-        *row = [e + h, f + g, f - g, e - h];
+        let e = r[0].wrapping_add(r[2]);
+        let f = r[0].wrapping_sub(r[2]);
+        let g = (r[1] >> 1).wrapping_sub(r[3]);
+        let h = r[1].wrapping_add(r[3] >> 1);
+        *row = [e.wrapping_add(h), f.wrapping_add(g), f.wrapping_sub(g), e.wrapping_sub(h)];
     }
     let mut o = [[0i32; 4]; 4];
     for j in 0..4 {
-        let e = t[0][j] + t[2][j];
-        let f = t[0][j] - t[2][j];
-        let g = (t[1][j] >> 1) - t[3][j];
-        let h = t[1][j] + (t[3][j] >> 1);
-        o[0][j] = e + h;
-        o[1][j] = f + g;
-        o[2][j] = f - g;
-        o[3][j] = e - h;
+        let e = t[0][j].wrapping_add(t[2][j]);
+        let f = t[0][j].wrapping_sub(t[2][j]);
+        let g = (t[1][j] >> 1).wrapping_sub(t[3][j]);
+        let h = t[1][j].wrapping_add(t[3][j] >> 1);
+        o[0][j] = e.wrapping_add(h);
+        o[1][j] = f.wrapping_add(g);
+        o[2][j] = f.wrapping_sub(g);
+        o[3][j] = e.wrapping_sub(h);
     }
     for (i, row) in o.iter().enumerate() {
         let Some(line) = dst.get_mut(i * stride..).and_then(|d| d.first_chunk_mut::<4>()) else {
             return;
         };
         for (p, &v) in line.iter_mut().zip(row) {
-            *p = clip_u8(*p as i32 + ((v + 32) >> 6));
+            *p = clip(p.to_i32().wrapping_add(v.wrapping_add(32) >> 6), max_val);
         }
     }
 }
 
 /// DC-only shortcut: all AC coefficients zero.
 #[allow(dead_code)]
-pub fn idct4_dc_add(dc: i32, dst: &mut [u8], stride: usize) {
-    let v = (dc + 32) >> 6;
+pub fn idct4_dc_add<S: Sample>(dc: i32, dst: &mut [S], stride: usize, max_val: i32) {
+    let v = dc.wrapping_add(32) >> 6;
     for i in 0..4 {
         for p in &mut dst[i * stride..i * stride + 4] {
-            *p = clip_u8(*p as i32 + v);
+            *p = clip(p.to_i32().wrapping_add(v), max_val);
         }
     }
 }
 
 #[inline(always)]
 fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
-    let a0 = d[0] + d[4];
-    let a4 = d[0] - d[4];
-    let a2 = (d[2] >> 1) - d[6];
-    let a6 = d[2] + (d[6] >> 1);
-    let b0 = a0 + a6;
-    let b2 = a4 + a2;
-    let b4 = a4 - a2;
-    let b6 = a0 - a6;
-    let a1 = -d[3] + d[5] - d[7] - (d[7] >> 1);
-    let a3 = d[1] + d[7] - d[3] - (d[3] >> 1);
-    let a5 = -d[1] + d[7] + d[5] + (d[5] >> 1);
-    let a7 = d[3] + d[5] + d[1] + (d[1] >> 1);
-    let b1 = a1 + (a7 >> 2);
-    let b7 = a7 - (a1 >> 2);
-    let b3 = a3 + (a5 >> 2);
-    let b5 = (a3 >> 2) - a5;
-    [b0 + b7, b2 + b5, b4 + b3, b6 + b1, b6 - b1, b4 - b3, b2 - b5, b0 - b7]
+    let a0 = d[0].wrapping_add(d[4]);
+    let a4 = d[0].wrapping_sub(d[4]);
+    let a2 = (d[2] >> 1).wrapping_sub(d[6]);
+    let a6 = d[2].wrapping_add(d[6] >> 1);
+    let b0 = a0.wrapping_add(a6);
+    let b2 = a4.wrapping_add(a2);
+    let b4 = a4.wrapping_sub(a2);
+    let b6 = a0.wrapping_sub(a6);
+    let a1 = d[3].wrapping_neg().wrapping_add(d[5]).wrapping_sub(d[7]).wrapping_sub(d[7] >> 1);
+    let a3 = d[1].wrapping_add(d[7]).wrapping_sub(d[3]).wrapping_sub(d[3] >> 1);
+    let a5 = d[1].wrapping_neg().wrapping_add(d[7]).wrapping_add(d[5]).wrapping_add(d[5] >> 1);
+    let a7 = d[3].wrapping_add(d[5]).wrapping_add(d[1]).wrapping_add(d[1] >> 1);
+    let b1 = a1.wrapping_add(a7 >> 2);
+    let b7 = a7.wrapping_sub(a1 >> 2);
+    let b3 = a3.wrapping_add(a5 >> 2);
+    let b5 = (a3 >> 2).wrapping_sub(a5);
+    [b0.wrapping_add(b7), b2.wrapping_add(b5), b4.wrapping_add(b3), b6.wrapping_add(b1),
+     b6.wrapping_sub(b1), b4.wrapping_sub(b3), b2.wrapping_sub(b5), b0.wrapping_sub(b7)]
 }
 
 /// Inverse 8x8 transform of raster-order `d` and add to `dst` (8.5.13.2): rows, then columns,
 /// the column pass and reconstruction across all columns at once (they vectorise).
-pub fn idct8_add(d: &[i32; 64], dst: &mut [u8], stride: usize) {
+pub fn idct8_add<S: Sample>(d: &[i32; 64], dst: &mut [S], stride: usize, max_val: i32) {
     let mut t = [[0i32; 8]; 8];
     for (row, src) in t.iter_mut().zip(d.as_chunks::<8>().0) {
         *row = idct8_1d(*src);
@@ -174,7 +199,7 @@ pub fn idct8_add(d: &[i32; 64], dst: &mut [u8], stride: usize) {
             return;
         };
         for (p, &v) in line.iter_mut().zip(row) {
-            *p = clip_u8(*p as i32 + ((v + 32) >> 6));
+            *p = clip(p.to_i32().wrapping_add(v.wrapping_add(32) >> 6), max_val);
         }
     }
 }
@@ -205,6 +230,34 @@ mod tests {
     }
 
     #[test]
+    fn ten_bit_primed_qp_and_reconstruction_range() {
+        assert_eq!(scale4(1, 160, 63), 10240);
+        assert_eq!(scale8(1, 320, 63), 5120);
+        let mut dc = [0; 16];
+        dc[0] = scale4(1, 160, 63);
+        let mut pixels = [512u16; 16];
+        idct4_add(&dc, &mut pixels, 4, 1023);
+        assert_eq!(pixels, [672; 16]);
+        dc[0] = 64 * 2048;
+        idct4_add(&dc, &mut pixels, 4, 1023);
+        assert_eq!(pixels, [1023; 16]);
+        dc[0] = -64 * 2048;
+        idct4_add(&dc, &mut pixels, 4, 1023);
+        assert_eq!(pixels, [0; 16]);
+    }
+
+    #[test]
+    fn hostile_transform_data_never_overflows() {
+        let mut dc = [i32::MAX; 16];
+        luma_dc_dequant(&mut dc, 63, 255 * 25);
+        let mut pixels = [512u16; 64];
+        idct4_add(&dc, &mut pixels, 8, 1023);
+        let large = std::array::from_fn(|i| if i % 2 == 0 { i32::MIN } else { i32::MAX });
+        idct8_add(&large, &mut pixels, 8, 1023);
+        assert!(pixels.iter().all(|&v| v <= 1023));
+    }
+
+    #[test]
     fn vectorised_transforms_match_reference() {
         let mut rng = 0x1234_5678_9abc_def1u64;
         let mut next = move || {
@@ -219,11 +272,11 @@ mod tests {
             let d8: [i32; 64] = std::array::from_fn(|_| (next() % (2 * range + 1)) as i32 - range as i32);
             let base: Vec<u8> = (0..24 * 8).map(|_| next() as u8).collect();
             let (mut a, mut b) = (base.clone(), base.clone());
-            idct4_add(&d4, &mut a[3..], 24);
+            idct4_add(&d4, &mut a[3..], 24, 255);
             reference_add(&d4, 4, &mut b[3..], 24);
             assert_eq!(a, b, "4x4 iteration {iter}");
             let (mut a, mut b) = (base.clone(), base);
-            idct8_add(&d8, &mut a[5..], 24);
+            idct8_add(&d8, &mut a[5..], 24, 255);
             reference_add(&d8, 8, &mut b[5..], 24);
             assert_eq!(a, b, "8x8 iteration {iter}");
         }
@@ -235,8 +288,8 @@ mod tests {
         d[0] = 640; // -> +10 everywhere
         let mut a = [100u8; 16];
         let mut b = [100u8; 16];
-        idct4_add(&d, &mut a, 4);
-        idct4_dc_add(640, &mut b, 4);
+        idct4_add(&d, &mut a, 4, 255);
+        idct4_dc_add(640, &mut b, 4, 255);
         assert_eq!(a, b);
         assert!(a.iter().all(|&v| v == 110));
     }
@@ -249,7 +302,7 @@ mod tests {
         d[0] = 64;
         d[1] = 64;
         let mut out = [0u8; 16];
-        idct4_add(&d, &mut out, 4);
+        idct4_add(&d, &mut out, 4, 255);
         for i in 0..4 {
             assert_eq!(&out[i * 4..i * 4 + 4], &[2, 2, 1, 0]);
         }
@@ -260,7 +313,7 @@ mod tests {
         let mut d = [0i32; 64];
         d[0] = 64 * 5;
         let mut out = [10u8; 64];
-        idct8_add(&d, &mut out, 8);
+        idct8_add(&d, &mut out, 8, 255);
         assert!(out.iter().all(|&v| v == 15));
     }
 
@@ -300,5 +353,45 @@ mod tests {
         let _ = scale4(i32::MAX, 16 * 25, 0);
         let _ = scale8(i32::MIN, 16 * 25, 51);
         let _ = scale8(i32::MIN, 16 * 25, 0);
+    }
+}
+
+#[cfg(test)]
+mod chroma_422_tests {
+    use super::*;
+
+    #[test]
+    fn dc_2x4_matches_matrix_and_scaling() {
+        let a = [[1i64, 1, 1, 1], [1, 1, -1, -1], [1, -1, -1, 1], [1, -1, 1, -1]];
+        let b = [[1i64, 1], [1, -1]];
+        let mut seed = 0x1234_5678u32;
+        for qp in 0..=51 {
+            for _ in 0..32 {
+                let input: [i32; 8] = std::array::from_fn(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((seed >> 16) % 2049) as i32 - 1024
+                });
+                let matrix = [[input[0], input[2]], [input[1], input[5]], [input[3], input[6]], [input[4], input[7]]];
+                let qpdc = qp + 3;
+                let ls = 16 * norm_adjust4((qpdc % 6) as usize, 0) as i32;
+                let mut got = input;
+                chroma_dc_dequant_422(&mut got, qp, ls);
+                for r in 0..4 {
+                    for col in 0..2 {
+                        let mut f = 0i64;
+                        for i in 0..4 {
+                            for j in 0..2 {
+                                f += a[r][i] * i64::from(matrix[i][j]) * b[j][col];
+                            }
+                        }
+                        let product = f * i64::from(ls);
+                        let expected = if qpdc >= 36 { product << (qpdc / 6 - 6) } else {
+                            (product + (1 << (5 - qpdc / 6))) >> (6 - qpdc / 6)
+                        };
+                        assert_eq!(i64::from(got[r * 2 + col]), expected, "QP'C {qp}, row {r}, col {col}");
+                    }
+                }
+            }
+        }
     }
 }

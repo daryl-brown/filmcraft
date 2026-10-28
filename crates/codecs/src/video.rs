@@ -302,29 +302,40 @@ impl H264Decoder {
         Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::with_threads(threads), length_size: 0, draft: false, threads }
     }
     fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
+        use filmcraft_h264::Plane;
         use std::sync::Arc;
-        let draft = p.draft;
         let (w, h) = (p.width as usize, p.height as usize);
         let (cw, ch) = (p.chroma_width as usize, p.chroma_height as usize);
-        let y = tight_plane(p.y, p.y_stride, w, h);
-        let u = tight_plane(p.u, p.uv_stride, cw, ch);
-        let v = tight_plane(p.v, p.uv_stride, cw, ch);
+        let chroma = if p.chroma_format_idc == 2 { filmcraft_frame::Chroma::C422 } else { filmcraft_frame::Chroma::C420 };
+        let (ys, uvs) = (p.y_stride, p.uv_stride);
+        let wide = |pl: Plane| -> Vec<u16> {
+            match pl {
+                Plane::U16(v) => v,
+                Plane::U8(v) => v.into_iter().map(u16::from).collect(),
+            }
+        };
+        let data = match (p.y, p.u, p.v) {
+            (Plane::U8(y), Plane::U8(u), Plane::U8(v)) => filmcraft_frame::PixelData::Yuv8 {
+                planes: [Arc::new(tight_plane(y, ys, w, h)), Arc::new(tight_plane(u, uvs, cw, ch)), Arc::new(tight_plane(v, uvs, cw, ch))],
+                chroma,
+                alpha: None,
+            },
+            (y, u, v) => filmcraft_frame::PixelData::Yuv16 {
+                planes: [Arc::new(tight_plane(wide(y), ys, w, h)), Arc::new(tight_plane(wide(u), uvs, cw, ch)), Arc::new(tight_plane(wide(v), uvs, cw, ch))],
+                chroma,
+                bits: p.bit_depth,
+                alpha: None,
+            },
+        };
         let color = vui_color(p.width, p.height, p.color.primaries, p.color.matrix, p.color.transfer, p.color.full_range);
         let par = sar_par(p.sar);
-        let frame = VideoFrame {
-            width: p.width,
-            height: p.height,
-            data: filmcraft_frame::PixelData::Yuv8 { planes: [Arc::new(y), Arc::new(u), Arc::new(v)], chroma: filmcraft_frame::Chroma::C420, alpha: None },
-            color,
-            par,
-            pts: filmcraft_time::Tick::ZERO,
-        };
-        DecodedFrame { pts: p.pts, frame, draft }
+        let frame = VideoFrame { width: p.width, height: p.height, data, color, par, pts: filmcraft_time::Tick::ZERO };
+        DecodedFrame { pts: p.pts, frame, draft: p.draft }
     }
 }
 
 /// An H.264 decoder error as a [`CodecError`]: a feature the decoder does not implement (High
-/// 4:2:2, field pictures...) is [`CodecError::Unsupported`], so the media pool shows the
+/// 4:2:2 inter prediction, field pictures...) is [`CodecError::Unsupported`], so the media pool shows the
 /// unreadable slate instead of a black picture (#626); anything else is a decode error.
 fn h264_error(e: filmcraft_h264::Error) -> CodecError {
     match e {
@@ -1296,7 +1307,7 @@ impl RawVideoDecoder {
                 }
                 let (mut y, mut u, mut v) = (Vec::with_capacity(w * h), Vec::with_capacity(cw * h), Vec::with_capacity(cw * h));
                 for row in s.chunks_exact(stride).take(h) {
-                    // the row's 10-bit samples in order: Cb Y Cr Y Cb Y Cr Y …, kept at 8 bits
+                    // the row's 10-bit samples in order: Cb Y Cr Y Cb Y Cr Y ..., kept at 8 bits
                     let mut comps = row.as_chunks::<4>().0.iter().flat_map(|b| {
                         let word = u32::from_le_bytes(*b);
                         [word & 0x3ff, (word >> 10) & 0x3ff, (word >> 20) & 0x3ff].map(|c| (c >> 2) as u8)

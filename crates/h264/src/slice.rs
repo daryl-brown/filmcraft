@@ -1,6 +1,6 @@
 //! NAL unit header and slice header parsing (7.3.1, 7.3.3).
 
-use crate::error::{Result, ensure};
+use crate::error::{Result, ensure, unsupported};
 use crate::params::{Pps, Sps};
 use filmcraft_bitstream::BitReader;
 
@@ -250,6 +250,9 @@ impl SliceHeader {
         let pps_id = r.read_ue()?;
         ensure!(pps_id < 256, "pic_parameter_set_id out of range");
         let (pps, sps) = pps_lookup(pps_id)?;
+        if sps.chroma_array_type() != 1 && !slice_type.is_intra() {
+            return unsupported("inter prediction for 4:2:2");
+        }
         let mut colour_plane_id = 0;
         if sps.separate_colour_plane {
             colour_plane_id = r.read_bits(2)?;
@@ -325,8 +328,9 @@ impl SliceHeader {
             ensure!(cabac_init_idc <= 2, "cabac_init_idc out of range");
         }
         let slice_qp_delta = r.read_se()?;
-        let qp = pps.pic_init_qp + slice_qp_delta;
-        ensure!((0..=51).contains(&qp), "slice QP {qp} out of range");
+        let qp = pps.pic_init_qp.checked_add(slice_qp_delta).ok_or_else(|| crate::Error::Invalid("slice QP overflow".into()))?;
+        let qp_bd_offset = 6 * (sps.bit_depth_luma - 8) as i32;
+        ensure!((-qp_bd_offset..=51).contains(&qp), "slice QP {qp} out of range");
         let mut sp_for_switch = false;
         let mut slice_qs_delta = 0;
         if matches!(slice_type, SliceType::Sp | SliceType::Si) {

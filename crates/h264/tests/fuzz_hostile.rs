@@ -24,6 +24,10 @@ impl Rng {
 
 /// (name, extra x264 args, pix_fmt)
 const SEEDS: &[(&str, &str, &str)] = &[
+    ("h422_fz_cabac", "-profile:v high422 -x264-params keyint=1:cabac=1:8x8dct=1", "yuv422p10le"),
+    ("h422_fz_cavlc", "-profile:v high422 -x264-params keyint=1:cabac=0:8x8dct=0", "yuv422p"),
+    ("h10_fz_cabac", "-profile:v high10 -bf 2 -g 6 -x264-params cabac=1:weightp=2:8x8dct=1", "yuv420p10le"),
+    ("h10_fz_cavlc", "-profile:v high10 -g 6 -x264-params cabac=0", "yuv420p10le"),
     ("h264_fz_cabac_b", "-profile:v high -bf 2 -g 8 -x264-params cabac=1:weightp=2:8x8dct=1", "yuv420p"),
     ("h264_fz_cavlc", "-profile:v baseline -g 6 -x264-params cabac=0", "yuv420p"),
     ("h264_fz_interlaced", "-profile:v high -flags +ildct+ilme -bf 1 -g 6 -x264-params tff=1:interlaced=1", "yuv420p"),
@@ -35,9 +39,14 @@ fn make(ff: &std::path::Path, name: &str, args: &str, pix: &str) -> Option<Vec<u
     let out = filmcraft_testkit::fixtures_dir("h264").join(format!("{name}.h264"));
     let p = filmcraft_testkit::fixtures::generate(&out, |tmp| {
         let a: Vec<&str> = args.split_whitespace().collect();
+        let (source, frames) = if matches!(pix, "yuv420p10le" | "yuv422p10le" | "yuv422p") {
+            ("testsrc2=size=64x64:rate=25", "6")
+        } else {
+            ("testsrc2=size=64x48:rate=25", "7")
+        };
         matches!(
             Command::new(ff)
-                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=64x48:rate=25", "-frames:v", "7", "-pix_fmt", pix, "-c:v", "libx264"])
+                .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", source, "-frames:v", frames, "-pix_fmt", pix, "-c:v", "libx264"])
                 .args(a)
                 .args(["-f", "h264"])
                 .arg(tmp)

@@ -35,9 +35,9 @@ fn main() {
         for p in pics {
             n += 1;
             if let Some(o) = out.as_mut() {
-                o.write_all(&p.y).unwrap();
-                o.write_all(&p.u).unwrap();
-                o.write_all(&p.v).unwrap();
+                write_plane(o, &p.y).unwrap();
+                write_plane(o, &p.u).unwrap();
+                write_plane(o, &p.v).unwrap();
             }
         }
     };
@@ -54,4 +54,11 @@ fn main() {
         eprintln!("{:#?}", dec.stats());
     }
     eprintln!("{n} frames in {dt:.3}s ({:.1} fps)", n as f64 / dt);
+}
+
+fn write_plane(out: &mut impl Write, plane: &filmcraft_h264::Plane) -> std::io::Result<()> {
+    match plane {
+        filmcraft_h264::Plane::U8(samples) => out.write_all(samples),
+        filmcraft_h264::Plane::U16(_) => out.write_all(&plane.to_le_bytes()),
+    }
 }

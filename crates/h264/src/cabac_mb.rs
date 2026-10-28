@@ -4,7 +4,7 @@
 use crate::cabac::Cabac;
 use crate::error::{Result, ensure, invalid};
 use crate::mbtypes::{MbTypeInfo, Part, SubMbInfo, b_mb_type, b_sub_mb_type, intra_mb_type, p_mb_type, p_sub_mb_type};
-use crate::picture::MbKind;
+use crate::picture::{MbKind, Sample};
 use crate::slice::SliceType;
 use crate::slicedec::{MbCur, SliceDecoder};
 
@@ -33,11 +33,12 @@ const IDENT_CTX: [u8; 64] = {
 };
 /// ctxIdxInc = Min(levelListIdx / NumC8x8, 2) for 4:2:0 chroma DC (ctxBlockCat 3).
 const CHROMA_DC_CTX: [u8; 4] = [0, 1, 2, 2];
+const CHROMA_DC_CTX_422: [u8; 8] = [0, 0, 1, 1, 2, 2, 2, 2];
 
 /// Table 9-40 ctxIdxBlockCatOffset for ctxBlockCat 0..=5: (coded_block_flag, significant/last, abs level).
 const CAT_OFFSET: [(usize, usize, usize); 6] = [(0, 0, 0), (4, 15, 10), (8, 29, 20), (12, 44, 30), (16, 47, 39), (0, 0, 0)];
 
-impl SliceDecoder<'_> {
+impl<S: Sample> SliceDecoder<'_, S> {
     /// Decode slice_data() with CABAC. `rbsp` is the whole slice RBSP.
     pub fn decode_cabac(&mut self, rbsp: &[u8]) -> Result<()> {
         let start = self.sh.header_bits.div_ceil(8) * 8;
@@ -371,20 +372,21 @@ impl SliceDecoder<'_> {
         let n = if bx < 0 { self.nb[0] } else { self.nb[1] };
         let Some(m) = n else { return intra_cur as usize };
         let st = &self.pic.mbs[m];
-        let (x, y) = if bx < 0 { (1, by as usize) } else { (bx as usize, 1) };
+        let (x, y) = if bx < 0 { (1, by as usize) } else { (bx as usize, self.pic.planes.mb_height_c / 4 - 1) };
         (st.nnz_c[comp][y * 2 + x] != 0) as usize
     }
 
     /// residual_block_cabac for ctxBlockCat `cat` (0..=5). Coefficients are written to `coeff`
     /// in list order (indices 0..max_num). `cbf_inc` is the coded_block_flag ctxIdxInc (ignored for cat 5).
     /// Returns the number of non-zero coefficients.
-    fn residual_block_cabac(&mut self, c: &mut Cabac, coeff: &mut [i32], cat: usize, max_num: usize, cbf_inc: usize) -> u8 {
+    fn residual_block_cabac(&mut self, c: &mut Cabac, coeff: &mut [i32], cat: usize, max_num: usize, cbf_inc: usize) -> Result<u8> {
         if cat != 5 && c.decode_decision(85 + CAT_OFFSET[cat].0 + cbf_inc) == 0 {
-            return 0;
+            return Ok(0);
         }
         let (sig_base, last_base, abs_base) =
             if cat == 5 { (402, 417, 426) } else { (105 + CAT_OFFSET[cat].1, 166 + CAT_OFFSET[cat].1, 227 + CAT_OFFSET[cat].2) };
         let (sig_tab, last_tab): (&[u8], &[u8]) = match cat {
+            3 if max_num == 8 => (&CHROMA_DC_CTX_422, &CHROMA_DC_CTX_422),
             3 => (&CHROMA_DC_CTX, &CHROMA_DC_CTX),
             5 => (&SIG8_FRAME, &LAST8),
             _ => (&IDENT_CTX, &IDENT_CTX),
@@ -422,20 +424,7 @@ impl SliceDecoder<'_> {
                 }
                 abs = prefix + 1;
                 if prefix == 14 {
-                    let mut k = 0;
-                    let mut suf = 0i32;
-                    while c.decode_bypass() == 1 {
-                        suf += 1 << k;
-                        k += 1;
-                        if k > 24 {
-                            break;
-                        }
-                    }
-                    while k > 0 {
-                        k -= 1;
-                        suf += (c.decode_bypass() as i32) << k;
-                    }
-                    abs += suf;
+                    abs += coeff_level_suffix(|| c.decode_bypass())?;
                 }
                 gt1 += 1;
             } else {
@@ -443,7 +432,7 @@ impl SliceDecoder<'_> {
             }
             coeff[p as usize] = if c.decode_bypass() == 1 { -abs } else { abs };
         }
-        n as u8
+        Ok(n as u8)
     }
 
     fn residual_cabac(&mut self, c: &mut Cabac, cbp: u8) -> Result<()> {
@@ -453,7 +442,7 @@ impl SliceDecoder<'_> {
         if kind == MbKind::I16x16 {
             let inc = self.cbf_dc_cond(self.nb[0], 0, intra) + 2 * self.cbf_dc_cond(self.nb[1], 0, intra);
             let mut lv = [0i32; 16];
-            if self.residual_block_cabac(c, &mut lv, 0, 16, inc) > 0 {
+            if self.residual_block_cabac(c, &mut lv, 0, 16, inc)? > 0 {
                 self.mb_mut().cbf_dc |= 1;
                 self.put_luma_dc(&lv);
             }
@@ -465,7 +454,7 @@ impl SliceDecoder<'_> {
             }
             if t8 {
                 let mut lv = [0i32; 64];
-                self.residual_block_cabac(c, &mut lv, 5, 64, 0);
+                self.residual_block_cabac(c, &mut lv, 5, 64, 0)?;
                 let st = self.mb_mut();
                 for r in [by8 * 4 + bx8, by8 * 4 + bx8 + 1, (by8 + 1) * 4 + bx8, (by8 + 1) * 4 + bx8 + 1] {
                     st.nnz[r] = 1;
@@ -478,9 +467,9 @@ impl SliceDecoder<'_> {
                     let inc = self.cbf_luma_cond(bx as i32 - 1, by as i32, intra) + 2 * self.cbf_luma_cond(bx as i32, by as i32 - 1, intra);
                     let mut lv = [0i32; 16];
                     let n = if kind == MbKind::I16x16 {
-                        self.residual_block_cabac(c, &mut lv[1..], 1, 15, inc)
+                        self.residual_block_cabac(c, &mut lv[1..], 1, 15, inc)?
                     } else {
-                        self.residual_block_cabac(c, &mut lv, 2, 16, inc)
+                        self.residual_block_cabac(c, &mut lv, 2, 16, inc)?
                     };
                     self.mb_mut().nnz[raster] = n;
                     if n > 0 {
@@ -494,8 +483,9 @@ impl SliceDecoder<'_> {
             for comp in 0..2 {
                 let bit = 1 + comp as u8;
                 let inc = self.cbf_dc_cond(self.nb[0], bit, intra) + 2 * self.cbf_dc_cond(self.nb[1], bit, intra);
-                let mut lv = [0i32; 4];
-                if self.residual_block_cabac(c, &mut lv, 3, 4, inc) > 0 {
+                let mut lv = [0i32; 8];
+                let n = self.pic.planes.mb_height_c / 2;
+                if self.residual_block_cabac(c, &mut lv, 3, n, inc)? > 0 {
                     self.mb_mut().cbf_dc |= 1 << bit;
                     self.put_chroma_dc(comp, &lv);
                 }
@@ -503,11 +493,11 @@ impl SliceDecoder<'_> {
         }
         if cbp_c == 2 {
             for comp in 0..2 {
-                for b in 0..4 {
+                for b in 0..self.pic.planes.mb_height_c / 2 {
                     let (bx, by) = ((b & 1) as i32, (b >> 1) as i32);
                     let inc = self.cbf_chroma_ac_cond(comp, bx - 1, by, intra) + 2 * self.cbf_chroma_ac_cond(comp, bx, by - 1, intra);
                     let mut lv = [0i32; 16];
-                    let n = self.residual_block_cabac(c, &mut lv[1..], 4, 15, inc);
+                    let n = self.residual_block_cabac(c, &mut lv[1..], 4, 15, inc)?;
                     self.mb_mut().nnz_c[comp][b] = n;
                     if n > 0 {
                         self.put_chroma_ac(comp, b, &lv);
@@ -526,11 +516,10 @@ impl SliceDecoder<'_> {
             // pcm alignment + samples, then re-initialise the arithmetic decoder
             let pos = c.bit_pos().div_ceil(8);
             let data = c.data();
-            ensure!(data.len() >= pos + 384, "truncated I_PCM macroblock");
-            let Some(&samples) = data.get(pos..).and_then(|d| d.first_chunk::<384>()) else {
-                return invalid("truncated I_PCM macroblock");
-            };
-            c.set_bit_pos((pos + 384) * 8);
+            let mut reader = filmcraft_bitstream::BitReader::new(data);
+            reader.skip(pos * 8)?;
+            let samples = crate::slicedec::read_pcm(&mut reader, self.bit_depth, self.pic.planes.mb_height_c)?;
+            c.set_bit_pos(reader.position());
             c.init_engine()?;
             self.finish_pcm();
             self.write_pcm(&samples);
@@ -684,5 +673,39 @@ impl SliceDecoder<'_> {
             return 1;
         }
         if c.decode_decision(67) == 0 { 2 } else { 3 }
+    }
+}
+
+/// Exp-Golomb bypass suffix (9.3.3.2). The bound keeps the suffix plus 15 in i32.
+fn coeff_level_suffix(mut bypass: impl FnMut() -> u32) -> Result<i32> {
+    let mut k = 0;
+    let mut suffix = 0i32;
+    while bypass() == 1 {
+        ensure!(k < 24, "coeff_abs_level_minus1 suffix too large");
+        suffix += 1 << k;
+        k += 1;
+    }
+    while k > 0 {
+        k -= 1;
+        suffix += (bypass() as i32) << k;
+    }
+    Ok(suffix)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    #[test]
+    fn coefficient_suffix_is_bounded() {
+        assert_eq!(coeff_level_suffix(|| 0).unwrap(), 0);
+        assert!(coeff_level_suffix(|| 1).is_err());
+        let mut calls = 0;
+        let suffix = coeff_level_suffix(|| {
+            calls += 1;
+            u32::from(calls != 25)
+        }).unwrap();
+        assert_eq!(suffix, (1 << 25) - 2);
+        assert_eq!(calls, 49);
     }
 }

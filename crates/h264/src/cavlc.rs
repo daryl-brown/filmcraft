@@ -201,6 +201,30 @@ mod tests {
     }
 
     #[test]
+    fn extended_level_prefix_and_limit() {
+        for prefix in [15, 16, 25, 26] {
+            let mut w = BitWriter::new();
+            let token = COEFF_TOKEN.iter().find(|e| e.0 == 0 && e.1 == 1).unwrap().2[0];
+            write_code(&mut w, token);
+            w.write_bits(0, prefix);
+            w.write_bit(true);
+            w.write_bits(0, prefix - 3);
+            write_code(&mut w, TOTAL_ZEROS_4X4[0][0]);
+            w.rbsp_trailing();
+            let bytes = w.finish();
+            let mut coeff = [0i32; 16];
+            let result = residual_block(&mut BitReader::new(&bytes), &mut coeff, 0, 15, 16, 0);
+            if prefix > 25 {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), 1);
+                let code = 15 + 15 + 2 + if prefix >= 16 { (1 << (prefix - 3)) - 4096 } else { 0 };
+                assert_eq!(coeff[0], (code + 2) >> 1);
+            }
+        }
+    }
+
+    #[test]
     fn coeff_token_tables_are_prefix_codes() {
         for col in 0..6 {
             let codes: Vec<&str> = COEFF_TOKEN.iter().map(|e| e.2[col]).collect();
@@ -277,5 +301,49 @@ mod tests {
         let tc = residual_block(&mut r, &mut c, 0, 15, 16, 0).unwrap();
         assert_eq!(tc, 5);
         assert_eq!(&c[..10], &[0, 3, -1, 0, 0, -1, 1, 0, 1, 0]);
+    }
+}
+
+#[cfg(test)]
+mod chroma_422_tests {
+    use super::*;
+    use filmcraft_bitstream::BitWriter;
+
+    fn parse(bits: &str) -> (u8, [i32; 8]) {
+        let mut w = BitWriter::new();
+        for bit in bits.bytes() { w.write_bit(bit == b'1'); }
+        w.rbsp_trailing();
+        let bytes = w.finish();
+        let mut coefficients = [0; 8];
+        let n = residual_block(&mut BitReader::new(&bytes), &mut coefficients, 0, 7, 8, -2).unwrap();
+        (n, coefficients)
+    }
+
+    #[test]
+    fn chroma_dc_2x4_hand_built_codes() {
+        // Table 9-5: (TotalCoeff, TrailingOnes) = (0,0): 1.
+        assert_eq!(parse("1"), (0, [0; 8]));
+        // (1,1): 01, positive sign: 0, Table 9-9(b) total_zeros = 7: 00000.
+        assert_eq!(parse("01000000"), (1, [0, 0, 0, 0, 0, 0, 0, 1]));
+        // (2,2): 001; signs +,-: 01; total_zeros = 6: 111;
+        // Table 9-10 zerosLeft = 6, run_before = 5: 101.
+        assert_eq!(parse("00101111101"), (2, [0, -1, 0, 0, 0, 0, 0, 1]));
+        // Table 9-9(b), every permitted total_zeros for every TotalCoeff.
+        let rows: [&[&str]; 7] = [
+            &["1", "010", "011", "0010", "0011", "0001", "00001", "00000"],
+            &["000", "01", "001", "100", "101", "110", "111"],
+            &["000", "001", "01", "10", "110", "111"],
+            &["110", "00", "01", "10", "111"],
+            &["00", "01", "10", "11"], &["00", "01", "1"], &["0", "1"],
+        ];
+        for (tc, row) in rows.iter().enumerate() {
+            for (zeros, code) in row.iter().enumerate() {
+                let mut w = BitWriter::new();
+                for bit in code.bytes() { w.write_bit(bit == b'1'); }
+                w.rbsp_trailing();
+                let bytes = w.finish();
+                assert_eq!(tables().total_zeros_2x4[tc].decode(&mut BitReader::new(&bytes)).unwrap(), zeros as u8);
+            }
+        }
     }
 }

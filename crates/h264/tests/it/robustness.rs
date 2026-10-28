@@ -77,7 +77,7 @@ fn xorshift(seed: &mut u64) -> u64 {
 /// Damaged streams must never panic or hang; errors are fine.
 #[test]
 fn corrupted_streams_do_not_panic() {
-    for name in ["main_cabac_b", "baseline_cif_noise", "cavlc_b", "bpyramid"] {
+    for name in ["main_cabac_b", "baseline_cif_noise", "cavlc_b", "bpyramid", "h10_bpyramid", "h10_intra_cabac0_t0"] {
         let f = common::fixture(name);
         let Some((h264, _)) = common::ensure(f) else { return };
         let data = std::fs::read(h264).unwrap();
@@ -117,4 +117,37 @@ fn garbage_input_is_rejected_gracefully() {
         let _ = dec.flush();
     }
     assert!(Decoder::from_avcc(&[1, 2, 3]).is_err());
+}
+
+#[test]
+fn hostile_ten_bit_streams_return_errors_without_panics() {
+    for name in ["h10_intra_cabac0_t0", "h10_intra_cabac1_t1", "h422_8_cabac0_t0", "h422_10_cabac1_t1"] {
+        let Some((path, _)) = common::ensure(common::fixture(name)) else { return };
+        let data = std::fs::read(path).unwrap();
+        let mut seed = 0x9876_5432_1234_5678;
+        let mut errors = 0;
+        for round in 0..64 {
+            let mut damaged = data.clone();
+            if round < 32 {
+                damaged.truncate(damaged.len() * round / 32);
+            } else {
+                for _ in 0..round {
+                    let pos = xorshift(&mut seed) as usize % damaged.len();
+                    damaged[pos] ^= xorshift(&mut seed) as u8;
+                }
+            }
+            let outcome = std::panic::catch_unwind(|| {
+                let mut decoder = Decoder::with_threads(1);
+                let mut error = false;
+                for au in common::split_access_units(&damaged) {
+                    error |= decoder.decode(au, 0).is_err();
+                }
+                decoder.flush();
+                error || decoder.take_error().is_some()
+            });
+            assert!(outcome.is_ok(), "{name}: mutation {round} panicked");
+            errors += outcome.unwrap() as usize;
+        }
+        assert!(errors > 0, "{name}: hostile inputs must report errors");
+    }
 }
