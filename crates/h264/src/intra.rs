@@ -270,11 +270,10 @@ pub fn pred16x16<S: Sample>(plane: &mut [S], stride: usize, x: usize, y: usize, 
     }
 }
 
-/// Chroma intra prediction for a 4:2:0 macroblock (8x8 block at chroma (x, y)), 8.3.4.
+/// Chroma intra prediction for an 8xH block, H = 8 (4:2:0) or 16 (4:2:2), 8.3.4.
 /// Modes: 0 DC, 1 horizontal, 2 vertical, 3 plane.
-pub fn pred_chroma<S: Sample>(plane: &mut [S], stride: usize, x: usize, y: usize, mode: u8, a: Avail, bit_depth: u32) {
+pub fn pred_chroma<S: Sample, const H: usize>(plane: &mut [S], stride: usize, x: usize, y: usize, mode: u8, a: Avail, bit_depth: u32) {
     const W: usize = 8;
-    const H: usize = 8;
     let mut top = [0i32; W];
     let mut left = [0i32; H];
     if a.top {
@@ -343,14 +342,17 @@ pub fn pred_chroma<S: Sample>(plane: &mut [S], stride: usize, x: usize, y: usize
             let mut v = 0;
             for k in 0..4 {
                 h += (k + 1) * (t(4 + k) - t(2 - k));
-                v += (k + 1) * (l(4 + k) - l(2 - k));
+            }
+            let half = H as i32 / 2;
+            for k in 0..half {
+                v += (k + 1) * (l(half + k) - l(half - 2 - k));
             }
             let aa = 16 * (left[H - 1] + top[W - 1]);
             let b = (34 * h + 32) >> 6;
-            let c = (34 * v + 32) >> 6;
+            let c = ((if H == 16 { 5 } else { 34 }) * v + 32) >> 6;
             for r in 0..H {
                 for cc in 0..W {
-                    plane[base + r * stride + cc] = clip((aa + b * (cc as i32 - 3) + c * (r as i32 - 3) + 16) >> 5, (1 << bit_depth) - 1);
+                    plane[base + r * stride + cc] = clip((aa + b * (cc as i32 - 3) + c * (r as i32 - (H as i32 / 2 - 1)) + 16) >> 5, (1 << bit_depth) - 1);
                 }
             }
         }
@@ -436,10 +438,63 @@ mod tests {
             p[3 * s + 4 + i] = if i < 4 { 40 } else { 80 };
             p[(4 + i) * s + 3] = if i < 4 { 8 } else { 16 };
         }
-        pred_chroma(&mut p, s, 4, 4, 0, ALL, 8);
+        pred_chroma::<_, 8>(&mut p, s, 4, 4, 0, ALL, 8);
         assert_eq!(p[4 * s + 4], (160 + 32 + 4) >> 3); // top-left block: both
         assert_eq!(p[4 * s + 8], 80); // top-right block: top only
         assert_eq!(p[8 * s + 4], 16); // bottom-left: left only
         assert_eq!(p[8 * s + 8], ((320 + 64 + 4) >> 3) as u8); // bottom-right: both
+    }
+}
+
+#[cfg(test)]
+mod chroma_422_tests {
+    use super::*;
+
+    #[test]
+    fn prediction_422_matches_direct_formulas() {
+        let stride = 24;
+        let (x, y) = (4, 4);
+        for depth in [8, 9, 10] {
+            let max = (1 << depth) - 1;
+            let neutral = 1 << (depth - 1);
+            let top: [i32; 8] = std::array::from_fn(|i| (i as i32 * 37 + 21) & max);
+            let left: [i32; 16] = std::array::from_fn(|i| (i as i32 * 23 + 49) & max);
+            let tl = 17;
+            for mode in 0..4 {
+                for mask in 0..4 {
+                    if mode != 0 && mask != 3 { continue; }
+                    let a = Avail { top: mask & 1 != 0, left: mask & 2 != 0, top_left: true, top_right: false };
+                    let mut plane = vec![0u16; stride * 24];
+                    for i in 0..8 { plane[(y - 1) * stride + x + i] = top[i] as u16; }
+                    for i in 0..16 { plane[(y + i) * stride + x - 1] = left[i] as u16; }
+                    plane[(y - 1) * stride + x - 1] = tl as u16;
+                    pred_chroma::<u16, 16>(&mut plane, stride, x, y, mode, a, depth);
+                    let h: i32 = (1..=4).map(|i| i * (top[(3 + i) as usize] - if i == 4 { tl } else { top[(3 - i) as usize] })).sum();
+                    let v: i32 = (1..=8).map(|i| i * (left[(7 + i) as usize] - if i == 8 { tl } else { left[(7 - i) as usize] })).sum();
+                    for row in 0..16 {
+                        for col in 0..8 {
+                            let bx = col / 4;
+                            let by = row / 4;
+                            let st: i32 = top[bx * 4..bx * 4 + 4].iter().sum();
+                            let sl: i32 = left[by * 4..by * 4 + 4].iter().sum();
+                            let dc = if a.top && a.left {
+                                if by == 0 && bx > 0 { (st + 2) / 4 }
+                                else if bx == 0 && by > 0 { (sl + 2) / 4 }
+                                else { (st + sl + 4) / 8 }
+                            } else if a.top { (st + 2) / 4 }
+                            else if a.left { (sl + 2) / 4 } else { neutral };
+                            let expected = match mode {
+                                0 => dc,
+                                1 => left[row],
+                                2 => top[col],
+                                _ => ((16 * (left[15] + top[7]) + ((34 * h + 32) >> 6) * (col as i32 - 3)
+                                    + ((5 * v + 32) >> 6) * (row as i32 - 7) + 16) >> 5).clamp(0, max),
+                            };
+                            assert_eq!(plane[(y + row) * stride + x + col], expected as u16, "depth {depth}, mode {mode}, mask {mask}, ({col},{row})");
+                        }
+                    }
+                }
+            }
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! Sequence and picture parameter sets (7.3.2.1, 7.3.2.2) including VUI and scaling lists.
 
-use crate::error::{Result, ensure, unsupported};
+use crate::error::{Result, ensure, invalid, unsupported};
 use crate::tables::{DEFAULT_4X4_INTER, DEFAULT_4X4_INTRA, DEFAULT_8X8_INTER, DEFAULT_8X8_INTRA, ZIGZAG4, ZIGZAG8};
 use filmcraft_bitstream::BitReader;
 
@@ -357,9 +357,11 @@ impl Sps {
             if chroma_format_idc == 3 {
                 separate_colour_plane = r.read_flag()?;
             }
-            bit_depth_luma = r.read_ue()? + 8;
-            bit_depth_chroma = r.read_ue()? + 8;
-            ensure!(bit_depth_luma <= 14 && bit_depth_chroma <= 14, "bit depth out of range");
+            let depth_y_minus8 = r.read_ue()?;
+            let depth_c_minus8 = r.read_ue()?;
+            ensure!(depth_y_minus8 <= 6 && depth_c_minus8 <= 6, "bit depth out of range");
+            bit_depth_luma = depth_y_minus8 + 8;
+            bit_depth_chroma = depth_c_minus8 + 8;
             bypass = r.read_flag()?;
             seq_scaling_matrix_present = r.read_flag()?;
             if seq_scaling_matrix_present {
@@ -367,8 +369,9 @@ impl Sps {
                 scaling_lists = parse_scaling_lists(&mut r, count, None)?;
             }
         }
-        let log2_max_frame_num = r.read_ue()? + 4;
-        ensure!(log2_max_frame_num <= 16, "log2_max_frame_num out of range");
+        let frame_num_minus4 = r.read_ue()?;
+        ensure!(frame_num_minus4 <= 12, "log2_max_frame_num out of range");
+        let log2_max_frame_num = frame_num_minus4 + 4;
         let pic_order_cnt_type = r.read_ue()?;
         ensure!(pic_order_cnt_type <= 2, "pic_order_cnt_type out of range");
         let mut log2_max_poc_lsb = 0;
@@ -377,8 +380,9 @@ impl Sps {
         let mut offset_for_top_to_bottom_field = 0;
         let mut offset_for_ref_frame = Vec::new();
         if pic_order_cnt_type == 0 {
-            log2_max_poc_lsb = r.read_ue()? + 4;
-            ensure!(log2_max_poc_lsb <= 16, "log2_max_pic_order_cnt_lsb out of range");
+            let poc_lsb_minus4 = r.read_ue()?;
+            ensure!(poc_lsb_minus4 <= 12, "log2_max_pic_order_cnt_lsb out of range");
+            log2_max_poc_lsb = poc_lsb_minus4 + 4;
         } else if pic_order_cnt_type == 1 {
             delta_pic_order_always_zero = r.read_flag()?;
             offset_for_non_ref_pic = r.read_se()?;
@@ -392,8 +396,8 @@ impl Sps {
         let max_num_ref_frames = r.read_ue()?;
         ensure!(max_num_ref_frames <= 16, "max_num_ref_frames out of range");
         let gaps_in_frame_num_allowed = r.read_flag()?;
-        let pic_width_in_mbs = r.read_ue()? + 1;
-        let pic_height_in_map_units = r.read_ue()? + 1;
+        let pic_width_in_mbs = r.read_ue()?.checked_add(1).ok_or_else(|| crate::Error::Invalid("picture width overflow".into()))?;
+        let pic_height_in_map_units = r.read_ue()?.checked_add(1).ok_or_else(|| crate::Error::Invalid("picture height overflow".into()))?;
         ensure!(pic_width_in_mbs <= 1024 && pic_height_in_map_units <= 1024, "picture too large");
         let frame_mbs_only = r.read_flag()?;
         let mb_adaptive_frame_field = if !frame_mbs_only { r.read_flag()? } else { false };
@@ -433,7 +437,7 @@ impl Sps {
         };
         if let Some((l, rr, t, b)) = sps.frame_crop {
             let (cx, cy) = sps.crop_unit();
-            ensure!((l + rr) * cx < sps.width() && (t + b) * cy < sps.height(), "frame cropping exceeds picture size");
+            ensure!((u64::from(l) + u64::from(rr)) * u64::from(cx) < u64::from(sps.width()) && (u64::from(t) + u64::from(b)) * u64::from(cy) < u64::from(sps.height()), "frame cropping exceeds picture size");
         }
         Ok(sps)
     }
@@ -520,14 +524,17 @@ impl Sps {
     }
 
     pub fn check_supported(&self) -> Result<()> {
+        if self.pic_width_in_mbs == 0 || self.pic_height_in_map_units == 0 || self.pic_width_in_mbs > 1024 || self.pic_height_in_map_units > 1024 {
+            return invalid("picture dimensions out of range");
+        }
         if u64::from(self.width()).saturating_mul(u64::from(self.height())) > MAX_LUMA_SAMPLES {
             return unsupported("picture dimensions exceed the decoder memory limit");
         }
         if !self.frame_mbs_only {
             return unsupported("interlaced (field / MBAFF) coding");
         }
-        if self.chroma_array_type() != 1 {
-            return unsupported(format!("chroma_format_idc {} (only 4:2:0 is implemented)", self.chroma_format_idc));
+        if !matches!(self.chroma_array_type(), 1 | 2) {
+            return unsupported(format!("chroma_format_idc {} (only 4:2:0 and intra 4:2:2 are implemented)", self.chroma_format_idc));
         }
         if self.bit_depth_luma != self.bit_depth_chroma || !(8..=10).contains(&self.bit_depth_luma) {
             return unsupported(format!("bit depth luma {} chroma {} (equal luma and chroma depths in 8 to 10 are required)", self.bit_depth_luma, self.bit_depth_chroma));

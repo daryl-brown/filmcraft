@@ -121,7 +121,7 @@ fn garbage_input_is_rejected_gracefully() {
 
 #[test]
 fn hostile_ten_bit_streams_return_errors_without_panics() {
-    for name in ["h10_intra_cabac0_t0", "h10_intra_cabac1_t1"] {
+    for name in ["h10_intra_cabac0_t0", "h10_intra_cabac1_t1", "h422_8_cabac0_t0", "h422_10_cabac1_t1"] {
         let Some((path, _)) = common::ensure(common::fixture(name)) else { return };
         let data = std::fs::read(path).unwrap();
         let mut seed = 0x9876_5432_1234_5678;

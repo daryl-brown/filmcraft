@@ -49,7 +49,7 @@ impl<S: Sample> PicState<S> {
     pub fn new(frame: FrameRef) -> Self {
         let (mb_w, mb_h) = (frame.mb_w, frame.mb_h());
         PicState {
-            planes: Planes::new(mb_w * 16, mb_h * 16, frame.bit_depth),
+            planes: Planes::new(mb_w * 16, mb_h * 16, frame.bit_depth, frame.chroma_format_idc),
             max_val: (1 << frame.bit_depth) - 1,
             mbs: vec![MbState::default(); mb_w * mb_h],
             slices: Vec::new(),
@@ -164,11 +164,11 @@ pub(crate) struct MbCur {
 pub(crate) struct Scratch<S: Sample> {
     /// Luma: 16 4x4 blocks (raster block index * 16 + raster coefficient) or 4 8x8 blocks (b8 * 64 + raster).
     pub coef: [i32; 256],
-    /// Chroma: [Cb, Cr][raster 2x2 block * 16 + raster coefficient].
-    pub coef_c: [[i32; 64]; 2],
+    /// Chroma: [Cb, Cr][raster 2x4 block * 16 + raster coefficient], first 4 blocks for 4:2:0.
+    pub coef_c: [[i32; 128]; 2],
     /// Luma blocks with coefficients: raster 4x4 bits, or b8 bits in 8x8 mode.
     pub blk_nz: u16,
-    /// Chroma blocks with coefficients (bit per raster 2x2 block).
+    /// Chroma blocks with coefficients (bit per raster block, up to eight).
     pub c_nz: [u8; 2],
     pub pred: [[S; 256]; 2],
     pub pred_c: [[[S; 64]; 2]; 2],
@@ -178,7 +178,7 @@ impl<S: Sample> Scratch<S> {
     pub fn new() -> Box<Self> {
         Box::new(Scratch {
             coef: [0; 256],
-            coef_c: [[0; 64]; 2],
+            coef_c: [[0; 128]; 2],
             blk_nz: 0,
             c_nz: [0; 2],
             pred: [[S::default(); 256]; 2],
@@ -256,6 +256,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
     pub fn new(sh: &'a SliceHeader, pps: &'a Pps, sps: &'a Sps, pic: &'a mut PicState<S>, refs: &'a [Vec<RefPic>; 2], ls: &'a LevelScale) -> Result<Self> {
         for reference in refs.iter().flatten() {
             ensure!(reference.frame.bit_depth == sps.bit_depth_luma, "reference picture bit depth differs from slice");
+            ensure!(u32::from(reference.frame.chroma_format_idc) == sps.chroma_format_idc, "reference picture chroma format differs from slice");
             ensure!(S::rows(&reference.frame).is_some(), "reference picture sample storage differs from slice");
         }
         let slice_num = pic.slices.len() as u32;
@@ -413,7 +414,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         let (bx, by) = (raster & 1, raster >> 1);
         let cur = self.mb();
         let a = if bx > 0 { Some(cur.nnz_c[c][raster - 1]) } else { self.nb[0].map(|m| self.pic.mbs[m].nnz_c[c][by * 2 + 1]) };
-        let b = if by > 0 { Some(cur.nnz_c[c][raster - 2]) } else { self.nb[1].map(|m| self.pic.mbs[m].nnz_c[c][2 + bx]) };
+        let b = if by > 0 { Some(cur.nnz_c[c][raster - 2]) } else { self.nb[1].map(|m| self.pic.mbs[m].nnz_c[c][(self.pic.planes.mb_height_c / 4 - 1) * 2 + bx]) };
         match (a, b) {
             (Some(a), Some(b)) => (a as i32 + b as i32 + 1) >> 1,
             (Some(a), None) => a as i32,
@@ -938,12 +939,12 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             if self.s.c_nz[c] == 0 {
                 continue;
             }
-            for b in 0..4 {
+            for b in 0..self.pic.planes.mb_height_c / 2 {
                 if self.s.c_nz[c] & (1 << b) == 0 {
                     continue;
                 }
                 let px = self.mb_x * 8 + (b & 1) * 4;
-                let py = self.mb_y * 8 + (b >> 1) * 4;
+                let py = self.mb_y * self.pic.planes.mb_height_c + (b >> 1) * 4;
                 let Some(blk) = self.s.coef_c[c].get_mut(b * 16..).and_then(<[i32]>::first_chunk_mut::<16>) else {
                     continue;
                 };
@@ -1021,9 +1022,15 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         let av = Avail { left: self.intra_nb(0), top: self.intra_nb(1), top_left: self.intra_nb(3), top_right: false };
         let cs = self.pic.planes.cwidth;
         let mode = self.mb().intra_chroma_mode;
-        let (cx, cy) = (self.mb_x * 8, self.mb_y * 8);
-        intra::pred_chroma(&mut self.pic.planes.cb, cs, cx, cy, mode, av, self.bit_depth);
-        intra::pred_chroma(&mut self.pic.planes.cr, cs, cx, cy, mode, av, self.bit_depth);
+        let hc = self.pic.planes.mb_height_c;
+        let (cx, cy) = (self.mb_x * 8, self.mb_y * hc);
+        if hc == 16 {
+            intra::pred_chroma::<S, 16>(&mut self.pic.planes.cb, cs, cx, cy, mode, av, self.bit_depth);
+            intra::pred_chroma::<S, 16>(&mut self.pic.planes.cr, cs, cx, cy, mode, av, self.bit_depth);
+        } else {
+            intra::pred_chroma::<S, 8>(&mut self.pic.planes.cb, cs, cx, cy, mode, av, self.bit_depth);
+            intra::pred_chroma::<S, 8>(&mut self.pic.planes.cr, cs, cx, cy, mode, av, self.bit_depth);
+        }
         self.add_chroma();
         self.s.blk_nz = 0;
     }
@@ -1051,11 +1058,13 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             S::copy_pcm(&mut self.pic.planes.y[(y0 + r) * stride + x0..(y0 + r) * stride + x0 + 16], &samples[r * 16..r * 16 + 16]);
         }
         let cs = self.pic.planes.cwidth;
-        let (cx, cy) = (self.mb_x * 8, self.mb_y * 8);
+        let hc = self.pic.planes.mb_height_c;
+        let (cx, cy) = (self.mb_x * 8, self.mb_y * hc);
         for c in 0..2 {
-            let src = &samples[256 + c * 64..256 + c * 64 + 64];
+            let n = 8 * hc;
+            let src = &samples[256 + c * n..256 + (c + 1) * n];
             let plane = if c == 0 { &mut self.pic.planes.cb } else { &mut self.pic.planes.cr };
-            for r in 0..8 {
+            for r in 0..hc {
                 S::copy_pcm(&mut plane[(cy + r) * cs + cx..(cy + r) * cs + cx + 8], &src[r * 8..r * 8 + 8]);
             }
         }
@@ -1071,7 +1080,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         st.qp = 0;
         st.qpc = qpc;
         st.nnz = [16; 16];
-        st.nnz_c = [[16; 4]; 2];
+        st.nnz_c = [[16; 8]; 2];
         st.cbf_dc = 7;
         st.cbp = 0x2f;
         st.nz_mask = 0xffff;
@@ -1158,14 +1167,24 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         }
     }
 
-    /// Chroma DC levels (4:2:0: 4 values in raster order) for component `c`.
-    pub fn put_chroma_dc(&mut self, c: usize, levels: &[i32; 4]) {
-        let mut v = *levels;
+    /// Chroma DC levels in scan order, scaled to raster block DC values (8.5.11).
+    pub fn put_chroma_dc(&mut self, c: usize, levels: &[i32; 8]) {
         let qpc = self.chroma_qp(self.qp, c) + 6 * (self.sps.bit_depth_chroma - 8) as i32;
         let list = if self.mb().kind.is_intra() { 1 + c } else { 4 + c };
-        let ls00 = self.ls.ls4[list][(qpc % 6) as usize][0];
-        transform::chroma_dc_dequant_420(&mut v, qpc, ls00);
-        for (b, &dc) in v.iter().enumerate() {
+        let mut v = *levels;
+        let n = if self.pic.planes.mb_height_c == 16 {
+            let qpdc = qpc + 3;
+            let ls00 = self.ls.ls4[list][(qpdc % 6) as usize][0];
+            transform::chroma_dc_dequant_422(&mut v, qpc, ls00);
+            8
+        } else {
+            let ls00 = self.ls.ls4[list][(qpc % 6) as usize][0];
+            let mut dc = [v[0], v[1], v[2], v[3]];
+            transform::chroma_dc_dequant_420(&mut dc, qpc, ls00);
+            v[..4].copy_from_slice(&dc);
+            4
+        };
+        for (b, &dc) in v.iter().enumerate().take(n) {
             if dc != 0 {
                 self.s.coef_c[c][b * 16] = dc;
                 self.s.c_nz[c] |= 1 << b;
@@ -1243,7 +1262,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         self.cur = MbCur { info, ..Default::default() };
         if info.kind == MbKind::IPcm {
             r.byte_align();
-            let samples = read_pcm(r, self.bit_depth)?;
+            let samples = read_pcm(r, self.bit_depth, self.pic.planes.mb_height_c)?;
             self.finish_pcm();
             self.write_pcm(&samples);
             return Ok(());
@@ -1415,14 +1434,16 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         let cbp_c = cbp >> 4;
         if cbp_c & 3 != 0 {
             for c in 0..2 {
-                let mut lv = [0i32; 4];
-                cavlc::residual_block(r, &mut lv, 0, 3, 4, -1)?;
+                let mut lv = [0i32; 8];
+                let n = self.pic.planes.mb_height_c / 2;
+                let nc = if n == 8 { -2 } else { -1 };
+                cavlc::residual_block(r, &mut lv, 0, n - 1, n, nc)?;
                 self.put_chroma_dc(c, &lv);
             }
         }
         if cbp_c & 2 != 0 {
             for c in 0..2 {
-                for b in 0..4 {
+                for b in 0..self.pic.planes.mb_height_c / 2 {
                     let nc = self.nc_chroma(c, b);
                     let mut lv = [0i32; 16];
                     let tc = cavlc::residual_block(r, &mut lv[1..], 0, 14, 15, nc)?;
@@ -1478,9 +1499,9 @@ fn wrap_qp(qp: i32, delta: i32, bd_offset: i32) -> Result<i32> {
     Ok((qp + delta + 52 + 2 * bd_offset) % (52 + bd_offset) - bd_offset)
 }
 
-pub(crate) fn read_pcm(r: &mut BitReader, bit_depth: u32) -> Result<[u16; 384]> {
-    let mut samples = [0u16; 384];
-    for sample in &mut samples {
+pub(crate) fn read_pcm(r: &mut BitReader, bit_depth: u32, mb_height_c: usize) -> Result<[u16; 512]> {
+    let mut samples = [0u16; 512];
+    for sample in &mut samples[..256 + 16 * mb_height_c] {
         *sample = r.read_bits(bit_depth)? as u16;
     }
     Ok(samples)

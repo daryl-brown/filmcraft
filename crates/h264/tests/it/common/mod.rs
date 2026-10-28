@@ -30,6 +30,197 @@ const NOISE: &str = "noise=alls=12:allf=t+u";
 
 pub const FIXTURES: &[Fixture] = &[
     Fixture {
+        name: "h422_8_cabac0_t0",
+        pix_fmt: "yuv422p",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=0:8x8dct=0"],
+    },
+    Fixture {
+        name: "h422_8_cabac0_t1",
+        pix_fmt: "yuv422p",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=0:8x8dct=1"],
+    },
+    Fixture {
+        name: "h422_8_cabac1_t0",
+        pix_fmt: "yuv422p",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=1:8x8dct=0"],
+    },
+    Fixture {
+        name: "h422_8_cabac1_t1",
+        pix_fmt: "yuv422p",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=1:8x8dct=1"],
+    },
+    Fixture {
+        name: "h422_10_cabac0_t0",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=0:8x8dct=0"],
+    },
+    Fixture {
+        name: "h422_10_cabac0_t1",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=0:8x8dct=1"],
+    },
+    Fixture {
+        name: "h422_10_cabac1_t0",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=1:8x8dct=0"],
+    },
+    Fixture {
+        name: "h422_10_cabac1_t1",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cabac=1:8x8dct=1"],
+    },
+    Fixture {
+        name: "h422_10_cqm",
+        pix_fmt: "yuv422p10le",
+        source: "mandelbrot",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:cqm=jvt"],
+    },
+    Fixture {
+        name: "h422_10_qp1",
+        pix_fmt: "yuv422p10le",
+        source: "mandelbrot",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1", "-qp", "1"],
+    },
+    Fixture {
+        name: "h422_10_qp50",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1", "-qp", "50"],
+    },
+    Fixture {
+        name: "h422_10_nodeblock",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:no-deblock=1"],
+    },
+    Fixture {
+        name: "h422_10_deblock",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:deblock=-2,2"],
+    },
+    Fixture {
+        name: "h422_10_slices",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:slices=4"],
+    },
+    Fixture {
+        name: "h422_10_chroma_m6",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:chroma-qp-offset=-6"],
+    },
+    Fixture {
+        name: "h422_10_chroma_p6",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:chroma-qp-offset=6"],
+    },
+    Fixture {
+        name: "h422_10_constrained",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 64,
+        height: 64,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:constrained-intra=1"],
+    },
+    Fixture {
+        name: "h422_10_crop",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 98,
+        height: 66,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1"],
+    },
+    Fixture {
+        name: "h422_10_large",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1"],
+    },
+
+    Fixture {
         name: "h10_intra_cabac0_t0",
         pix_fmt: "yuv420p10le",
         source: "testsrc2",
@@ -643,9 +834,10 @@ pub fn decode_file_opts(path: &Path, threads: usize, draft: bool) -> Result<Vec<
     Ok(out)
 }
 
-/// Compare native samples with yuv420p or little-endian word references, reporting the first mismatch.
+/// Compare native 4:2:0 / 4:2:2 samples with byte or little-endian word references.
 pub fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result<(), String> {
-    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let hc = if pics.first().is_some_and(|p| p.chroma_format_idc == 2) { 16 } else { 8 };
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(16 / hc));
     let bytes_per_sample = if pics.first().is_some_and(|p| p.bit_depth > 8) { 2 } else { 1 };
     let fsize = (w * h + 2 * cw * ch) * bytes_per_sample;
     let nref = reference.len() / fsize;
@@ -656,6 +848,9 @@ pub fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result
         if p.width as usize != w || p.height as usize != h {
             return Err(format!("frame {i}: size {}x{} != {}x{}", p.width, p.height, w, h));
         }
+        if p.chroma_width as usize != cw || p.chroma_height as usize != ch {
+            return Err(format!("frame {i}: chroma dimensions differ"));
+        }
         let f = &reference[i * fsize..(i + 1) * fsize];
         let samples: Vec<u16> = if bytes_per_sample == 2 {
             f.chunks_exact(2).map(|v| u16::from_le_bytes([v[0], v[1]])).collect()
@@ -663,11 +858,11 @@ pub fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result
             f.iter().map(|&v| u16::from(v)).collect()
         };
         let planes = [
-            ("Y", &p.y, &samples[..w * h], w, h, 16),
-            ("U", &p.u, &samples[w * h..w * h + cw * ch], cw, ch, 8),
-            ("V", &p.v, &samples[w * h + cw * ch..], cw, ch, 8),
+            ("Y", &p.y, &samples[..w * h], w, h, 16, 16),
+            ("U", &p.u, &samples[w * h..w * h + cw * ch], cw, ch, 8, hc),
+            ("V", &p.v, &samples[w * h + cw * ch..], cw, ch, 8, hc),
         ];
-        for (name, got, exp, pw, ph, mbs) in planes {
+        for (name, got, exp, pw, ph, mbs, mbh) in planes {
             if got.len() != exp.len() {
                 return Err(format!("frame {i} plane {name}: sample count differs"));
             }
@@ -693,9 +888,9 @@ pub fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result
                     "frame {i} (poc {}, pts {}) plane {name}: first mismatch at ({x},{y}) MB {} (mb_x {}, mb_y {}): got {a} want {b}; {count} samples differ, max diff {maxd}",
                     p.poc,
                     p.pts,
-                    (y / mbs) * mb_w + x / mbs,
+                    (y / mbh) * mb_w + x / mbs,
                     x / mbs,
-                    y / mbs
+                    y / mbh
                 ));
             }
         }

@@ -306,6 +306,7 @@ impl H264Decoder {
         use std::sync::Arc;
         let (w, h) = (p.width as usize, p.height as usize);
         let (cw, ch) = (p.chroma_width as usize, p.chroma_height as usize);
+        let chroma = if p.chroma_format_idc == 2 { filmcraft_frame::Chroma::C422 } else { filmcraft_frame::Chroma::C420 };
         let (ys, uvs) = (p.y_stride, p.uv_stride);
         let wide = |pl: Plane| -> Vec<u16> {
             match pl {
@@ -316,12 +317,12 @@ impl H264Decoder {
         let data = match (p.y, p.u, p.v) {
             (Plane::U8(y), Plane::U8(u), Plane::U8(v)) => filmcraft_frame::PixelData::Yuv8 {
                 planes: [Arc::new(tight_plane(y, ys, w, h)), Arc::new(tight_plane(u, uvs, cw, ch)), Arc::new(tight_plane(v, uvs, cw, ch))],
-                chroma: filmcraft_frame::Chroma::C420,
+                chroma,
                 alpha: None,
             },
             (y, u, v) => filmcraft_frame::PixelData::Yuv16 {
                 planes: [Arc::new(tight_plane(wide(y), ys, w, h)), Arc::new(tight_plane(wide(u), uvs, cw, ch)), Arc::new(tight_plane(wide(v), uvs, cw, ch))],
-                chroma: filmcraft_frame::Chroma::C420,
+                chroma,
                 bits: p.bit_depth,
                 alpha: None,
             },
@@ -334,7 +335,7 @@ impl H264Decoder {
 }
 
 /// An H.264 decoder error as a [`CodecError`]: a feature the decoder does not implement (High
-/// 4:2:2, field pictures...) is [`CodecError::Unsupported`], so the media pool shows the
+/// 4:2:2 inter prediction, field pictures...) is [`CodecError::Unsupported`], so the media pool shows the
 /// unreadable slate instead of a black picture (#626); anything else is a decode error.
 fn h264_error(e: filmcraft_h264::Error) -> CodecError {
     match e {
@@ -1306,7 +1307,7 @@ impl RawVideoDecoder {
                 }
                 let (mut y, mut u, mut v) = (Vec::with_capacity(w * h), Vec::with_capacity(cw * h), Vec::with_capacity(cw * h));
                 for row in s.chunks_exact(stride).take(h) {
-                    // the row's 10-bit samples in order: Cb Y Cr Y Cb Y Cr Y …, kept at 8 bits
+                    // the row's 10-bit samples in order: Cb Y Cr Y Cb Y Cr Y ..., kept at 8 bits
                     let mut comps = row.as_chunks::<4>().0.iter().flat_map(|b| {
                         let word = u32::from_le_bytes(*b);
                         [word & 0x3ff, (word >> 10) & 0x3ff, (word >> 20) & 0x3ff].map(|c| (c >> 2) as u8)

@@ -166,7 +166,7 @@ pub fn stores_u8(bit_depth: u32, bit_depth_c: u32) -> bool {
     bit_depth <= 8 && bit_depth_c <= 8
 }
 
-/// Planar 4:2:0 sample buffers (MB-aligned dimensions, stride == width).
+/// Planar sample buffers (MB-aligned dimensions, stride == width).
 #[derive(Clone)]
 pub struct Planes<S: Sample> {
     pub y: Vec<S>,
@@ -175,11 +175,13 @@ pub struct Planes<S: Sample> {
     pub width: usize,
     pub height: usize,
     pub cwidth: usize,
+    pub mb_height_c: usize,
 }
 
 impl<S: Sample> Planes<S> {
-    pub fn new(width: usize, height: usize, bit_depth: u32) -> Self {
-        let (cw, ch) = (width / 2, height / 2);
+    pub fn new(width: usize, height: usize, bit_depth: u32, chroma_format_idc: u8) -> Self {
+        let mb_height_c = if chroma_format_idc == 2 { 16 } else { 8 };
+        let (cw, ch) = (width / 2, height * mb_height_c / 16);
         Planes {
             y: vec![S::default(); width * height],
             cb: vec![S::from_i32(1 << (bit_depth - 1)); cw * ch],
@@ -187,10 +189,11 @@ impl<S: Sample> Planes<S> {
             width,
             height,
             cwidth: cw,
+            mb_height_c,
         }
     }
-    pub fn gray(width: usize, height: usize, bit_depth: u32) -> Self {
-        let mut p = Self::new(width, height, bit_depth);
+    pub fn gray(width: usize, height: usize, bit_depth: u32, chroma_format_idc: u8) -> Self {
+        let mut p = Self::new(width, height, bit_depth, chroma_format_idc);
         p.y.fill(S::from_i32(1 << (bit_depth - 1)));
         p
     }
@@ -237,8 +240,8 @@ pub struct MbState {
     pub intra_modes: [u8; 16],
     /// CAVLC: TotalCoeff per luma 4x4 block (raster). CABAC: coded_block_flag.
     pub nnz: [u8; 16],
-    /// Same for chroma AC blocks [Cb, Cr][raster 2x2].
-    pub nnz_c: [[u8; 4]; 2],
+    /// Same for chroma AC blocks [Cb, Cr][raster 2 wide by up to 4 high].
+    pub nnz_c: [[u8; 8]; 2],
     /// CABAC coded_block_flag of DC blocks: bit0 luma (I16x16), bit1 Cb, bit2 Cr.
     pub cbf_dc: u8,
     /// Luma 4x4 blocks (raster bit) with non-zero coefficients, for deblocking bS = 2.
@@ -271,7 +274,7 @@ impl Default for MbState {
             intra_chroma_mode: 0,
             intra_modes: [2; 16],
             nnz: [0; 16],
-            nnz_c: [[0; 4]; 2],
+            nnz_c: [[0; 8]; 2],
             cbf_dc: 0,
             nz_mask: 0,
             ref_idx: [[-1; 4]; 2],
@@ -287,7 +290,7 @@ impl Default for MbState {
 pub struct FrameRow<S: Sample> {
     /// 16 luma lines.
     pub y: Box<[S]>,
-    /// 8 lines per chroma component.
+    /// 8 or 16 lines per chroma component.
     pub cb: Box<[S]>,
     pub cr: Box<[S]>,
     /// Per 4x4 block: index mb_x * 16 + raster.
@@ -316,6 +319,8 @@ pub struct Frame {
     pub height: usize,
     pub cwidth: usize,
     pub cheight: usize,
+    pub mb_height_c: usize,
+    pub chroma_format_idc: u8,
     pub mb_w: usize,
     pub bit_depth: u32,
     rows: Rows,
@@ -335,12 +340,13 @@ fn wait<T>(cell: &OnceLock<T>) -> Option<&T> {
 }
 
 impl Frame {
-    pub fn new(id: u32, poc: i32, mb_w: usize, mb_h: usize, bit_depth: u32) -> Self {
+    pub fn new(id: u32, poc: i32, mb_w: usize, mb_h: usize, bit_depth: u32, chroma_format_idc: u8) -> Self {
         fn cells<S: Sample>(n: usize) -> Rows {
             S::wrap_rows((0..n).map(|_| OnceLock::new()).collect())
         }
         let rows = if stores_u8(bit_depth, bit_depth) { cells::<u8>(mb_h) } else { cells::<u16>(mb_h) };
-        Frame { id, poc, width: mb_w * 16, height: mb_h * 16, cwidth: mb_w * 8, cheight: mb_h * 8, mb_w, bit_depth, rows }
+        let mb_height_c = if chroma_format_idc == 2 { 16 } else { 8 };
+        Frame { id, poc, width: mb_w * 16, height: mb_h * 16, cwidth: mb_w * 8, cheight: mb_h * mb_height_c, mb_height_c, chroma_format_idc, mb_w, bit_depth, rows }
     }
 
     pub fn mb_h(&self) -> usize {
@@ -392,8 +398,9 @@ impl Frame {
         let cw = planes.cwidth;
         let mb_w = w / 16;
         let y = planes.y[r * 16 * w..(r + 1) * 16 * w].into();
-        let cb = planes.cb[r * 8 * cw..(r + 1) * 8 * cw].into();
-        let cr = planes.cr[r * 8 * cw..(r + 1) * 8 * cw].into();
+        let hc = planes.mb_height_c;
+        let cb = planes.cb[r * hc * cw..(r + 1) * hc * cw].into();
+        let cr = planes.cr[r * hc * cw..(r + 1) * hc * cw].into();
         let row_mbs = &mbs[r * mb_w..(r + 1) * mb_w];
         let mut mv = [vec![[0i16; 2]; mb_w * 16], vec![[0i16; 2]; mb_w * 16]];
         let mut ref_idx = [vec![-1i8; mb_w * 4], vec![-1i8; mb_w * 4]];
@@ -425,7 +432,7 @@ impl Frame {
     /// frames inferred for frame_num gaps.
     pub fn from_planes<S: Sample>(id: u32, poc: i32, planes: &Planes<S>, bit_depth: u32) -> Self {
         let (mb_w, mb_h) = (planes.width / 16, planes.height / 16);
-        let f = Frame::new(id, poc, mb_w, mb_h, bit_depth);
+        let f = Frame::new(id, poc, mb_w, mb_h, bit_depth, if planes.mb_height_c == 16 { 2 } else { 1 });
         let blank = vec![MbState::default(); mb_w * mb_h];
         for r in 0..mb_h {
             f.publish(r, Frame::make_row(planes, r, &blank, &|_, _, _| u32::MAX));
@@ -451,9 +458,9 @@ impl Frame {
         let (cw, ch) = (self.cwidth, self.cheight);
         for r in 0..h {
             let yy = (y0 + r as i32).clamp(0, ch as i32 - 1) as usize;
-            let Some(row) = self.row::<S>(yy >> 3) else { return };
+            let Some(row) = self.row::<S>(yy >> self.mb_height_c.trailing_zeros()) else { return };
             let plane = if c == 0 { &row.cb } else { &row.cr };
-            let line = &plane[(yy & 7) * cw..(yy & 7) * cw + cw];
+            let line = &plane[(yy & (self.mb_height_c - 1)) * cw..(yy & (self.mb_height_c - 1)) * cw + cw];
             copy_line::<S, 16>(line, x0, &mut out[r * os..], w);
         }
     }
@@ -474,12 +481,13 @@ impl Frame {
             let Some(row) = self.row::<S>(r >> 4) else { continue };
             y.extend_from_slice(&row.y[(r & 15) * self.width + cx..(r & 15) * self.width + cx + cw]);
         }
-        let (ccx, ccy, ccw, cch) = (cx / 2, cy / 2, cw.div_ceil(2), ch.div_ceil(2));
+        let sub_h = 16 / self.mb_height_c;
+        let (ccx, ccy, ccw, cch) = (cx / 2, cy / sub_h, cw.div_ceil(2), ch.div_ceil(sub_h));
         let mut u = alloc(ccw * cch);
         let mut v = alloc(ccw * cch);
         for r in ccy..ccy + cch {
-            let Some(row) = self.row::<S>(r >> 3) else { continue };
-            let o = (r & 7) * self.cwidth + ccx;
+            let Some(row) = self.row::<S>(r >> self.mb_height_c.trailing_zeros()) else { continue };
+            let o = (r & (self.mb_height_c - 1)) * self.cwidth + ccx;
             u.extend_from_slice(&row.cb[o..o + ccw]);
             v.extend_from_slice(&row.cr[o..o + ccw]);
         }

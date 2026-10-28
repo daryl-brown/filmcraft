@@ -408,14 +408,14 @@ impl Decoder {
     fn start_picture(&mut self, sh: &SliceHeader, sps: &Arc<Sps>, pts: i64) -> Result<()> {
         if !sh.idr && let Some(active) = &self.active_sps {
             ensure!(
-                active.bit_depth_luma == sps.bit_depth_luma && active.bit_depth_chroma == sps.bit_depth_chroma,
-                "bit depth change requires an IDR picture"
+                active.bit_depth_luma == sps.bit_depth_luma && active.bit_depth_chroma == sps.bit_depth_chroma && active.chroma_format_idc == sps.chroma_format_idc,
+                "bit depth or chroma format change requires an IDR picture"
             );
         }
         // Activate SPS; a resolution change flushes the DPB.
         let changed = match &self.active_sps {
             None => true,
-            Some(a) => a.width() != sps.width() || a.height() != sps.height() || a.max_dpb_frames() != sps.max_dpb_frames(),
+            Some(a) => a.width() != sps.width() || a.height() != sps.height() || a.max_dpb_frames() != sps.max_dpb_frames() || a.chroma_format_idc != sps.chroma_format_idc,
         };
         if changed && self.active_sps.is_some() {
             let mut outs = Vec::new();
@@ -451,9 +451,9 @@ impl Decoder {
                     *next_id += 1;
                     let bit_depth = sps.bit_depth_luma;
                     let frame = if stores_u8(bit_depth, sps.bit_depth_chroma) {
-                        gap_frame_as::<u8>(last.as_deref(), id, mb_w, mb_h, bit_depth)
+                        gap_frame_as::<u8>(last.as_deref(), id, mb_w, mb_h, bit_depth, sps.chroma_format_idc as u8)
                     } else {
-                        gap_frame_as::<u16>(last.as_deref(), id, mb_w, mb_h, bit_depth)
+                        gap_frame_as::<u16>(last.as_deref(), id, mb_w, mb_h, bit_depth, sps.chroma_format_idc as u8)
                     };
                     (Arc::new(frame), 0, meta.clone())
                 };
@@ -468,7 +468,7 @@ impl Decoder {
         let frame_poc = if sh.has_mmco5() { 0 } else { poc.frame() };
         let id = self.next_id;
         self.next_id += 1;
-        let frame = Arc::new(Frame::new(id, frame_poc, mb_w, mb_h, sps.bit_depth_luma));
+        let frame = Arc::new(Frame::new(id, frame_poc, mb_w, mb_h, sps.bit_depth_luma, sps.chroma_format_idc as u8));
         self.pending = Some(PendingPic { frame, sps: sps.clone(), first: sh.clone(), poc, pts, key: sh.idr, slices: Vec::new() });
         Ok(())
     }
@@ -525,7 +525,7 @@ fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool)
 fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool, pool: &Mutex<Vec<PicState<S>>>) {
     let reuse = pool.lock().ok().and_then(|mut p| p.pop());
     let mut pic = match reuse {
-        Some(mut p) if p.mb_w == frame.mb_w && p.mb_h == frame.mb_h() && p.frame.bit_depth == frame.bit_depth => {
+        Some(mut p) if p.mb_w == frame.mb_w && p.mb_h == frame.mb_h() && p.frame.bit_depth == frame.bit_depth && p.frame.chroma_format_idc == frame.chroma_format_idc => {
             p.reset(frame.clone());
             p
         }
@@ -546,7 +546,7 @@ fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared
         Ok(e) => e,
         Err(_) => {
             // Make sure readers never block on this frame.
-            let fallback = Planes::<S>::gray(frame.width, frame.height, frame.bit_depth);
+            let fallback = Planes::<S>::gray(frame.width, frame.height, frame.bit_depth, frame.chroma_format_idc);
             let blank = vec![MbState::default(); frame.mb_w * frame.mb_h()];
             for r in 0..frame.mb_h() {
                 if !frame.is_published(r) {
@@ -617,11 +617,12 @@ fn make_picture(o: &Output<FrameRef>) -> Picture {
     let (cx, cy, cw, ch) = o.meta.crop;
     let (cx, cy, cw, ch) = (cx as usize, cy as usize, cw as usize, ch as usize);
     let (y, u, v) = o.frame.copy_cropped((cx, cy, cw, ch));
-    let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(2));
+    let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(16 / o.frame.mb_height_c));
     Picture {
         width: cw as u32,
         bit_depth: o.frame.bit_depth,
         height: ch as u32,
+        chroma_format_idc: o.frame.chroma_format_idc,
         chroma_width: ccw as u32,
         chroma_height: cch as u32,
         y,
@@ -644,10 +645,10 @@ fn make_picture(o: &Output<FrameRef>) -> Picture {
 }
 
 /// Samples for a non-existing reference picture (8.2.5.2).
-fn gap_frame_as<S: Sample>(last: Option<&Frame>, id: u32, mb_w: usize, mb_h: usize, bit_depth: u32) -> Frame {
+fn gap_frame_as<S: Sample>(last: Option<&Frame>, id: u32, mb_w: usize, mb_h: usize, bit_depth: u32, chroma_format_idc: u8) -> Frame {
     let planes = match last {
-        Some(f) if f.mb_w == mb_w && f.mb_h() == mb_h && f.bit_depth == bit_depth => {
-            let mut p = Planes::<S>::new(mb_w * 16, mb_h * 16, bit_depth);
+        Some(f) if f.mb_w == mb_w && f.mb_h() == mb_h && f.bit_depth == bit_depth && f.chroma_format_idc == chroma_format_idc => {
+            let mut p = Planes::<S>::new(mb_w * 16, mb_h * 16, bit_depth, chroma_format_idc);
             let (y, u, v) = f.copy_cropped((0, 0, mb_w * 16, mb_h * 16));
             if let (Some(y), Some(u), Some(v)) = (S::plane_samples(y), S::plane_samples(u), S::plane_samples(v)) {
                 p.y = y;
@@ -656,7 +657,7 @@ fn gap_frame_as<S: Sample>(last: Option<&Frame>, id: u32, mb_w: usize, mb_h: usi
             }
             p
         }
-        _ => Planes::<S>::gray(mb_w * 16, mb_h * 16, bit_depth),
+        _ => Planes::<S>::gray(mb_w * 16, mb_h * 16, bit_depth, chroma_format_idc),
     };
     Frame::from_planes(id, 0, &planes, bit_depth)
 }

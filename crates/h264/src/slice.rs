@@ -1,6 +1,6 @@
 //! NAL unit header and slice header parsing (7.3.1, 7.3.3).
 
-use crate::error::{Result, ensure};
+use crate::error::{Result, ensure, unsupported};
 use crate::params::{Pps, Sps};
 use filmcraft_bitstream::BitReader;
 
@@ -250,6 +250,9 @@ impl SliceHeader {
         let pps_id = r.read_ue()?;
         ensure!(pps_id < 256, "pic_parameter_set_id out of range");
         let (pps, sps) = pps_lookup(pps_id)?;
+        if sps.chroma_array_type() != 1 && !slice_type.is_intra() {
+            return unsupported("inter prediction for 4:2:2");
+        }
         let mut colour_plane_id = 0;
         if sps.separate_colour_plane {
             colour_plane_id = r.read_bits(2)?;

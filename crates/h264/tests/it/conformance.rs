@@ -18,6 +18,26 @@ macro_rules! fixture_tests {
 }
 
 fixture_tests!(
+    h422_8_cabac0_t0,
+    h422_8_cabac0_t1,
+    h422_8_cabac1_t0,
+    h422_8_cabac1_t1,
+    h422_10_cabac0_t0,
+    h422_10_cabac0_t1,
+    h422_10_cabac1_t0,
+    h422_10_cabac1_t1,
+    h422_10_cqm,
+    h422_10_qp1,
+    h422_10_qp50,
+    h422_10_nodeblock,
+    h422_10_deblock,
+    h422_10_slices,
+    h422_10_chroma_m6,
+    h422_10_chroma_p6,
+    h422_10_constrained,
+    h422_10_crop,
+    h422_10_large,
+
     h10_intra_cabac0_t0,
     h10_intra_cabac0_t1,
     h10_intra_cabac1_t0,
@@ -210,4 +230,56 @@ fn concurrent_fixture_publication_is_safe() {
     drop(results);
     std::fs::remove_file(paths.0).unwrap();
     std::fs::remove_file(paths.1).unwrap();
+}
+
+/// Long-GOP High 4:2:2 must fail at the first inter slice, before reconstruction.
+#[test]
+fn h422_long_gop_returns_unsupported() {
+    let f = common::Fixture {
+        name: "h422_long_gop", pix_fmt: "yuv422p10le", source: "testsrc2",
+        width: 64, height: 64, frames: 6, filter: "",
+        args: &["-profile:v", "high422", "-x264-params", "keyint=30:min-keyint=30:scenecut=0:bframes=2:b-adapt=0"],
+    };
+    let Some((path, _)) = common::ensure(&f) else { return };
+    let data = std::fs::read(path).unwrap();
+    for threads in [1, 3, 0] {
+        let outcome = std::panic::catch_unwind(|| {
+            let mut decoder = filmcraft_h264::Decoder::with_threads(threads);
+            let mut rejected = false;
+            for au in common::split_access_units(&data) {
+                if let Err(error) = decoder.decode(au, 0) {
+                    assert!(matches!(error, filmcraft_h264::Error::Unsupported(ref message) if message == "inter prediction for 4:2:2"));
+                    rejected = true;
+                    break;
+                }
+            }
+            decoder.flush();
+            assert!(decoder.take_error().is_none());
+            assert!(rejected, "inter slice must be rejected");
+        });
+        assert!(outcome.is_ok(), "long-GOP rejection panicked");
+    }
+}
+
+/// Intra reference pictures keep exact output in draft mode, including frame threads.
+#[test]
+fn h422_draft_and_stats() {
+    for name in ["h422_8_cabac0_t0", "h422_10_cabac1_t1"] {
+        let f = common::fixture(name);
+        let Some((path, yuv)) = common::ensure(f) else { return };
+        let reference = std::fs::read(yuv).unwrap();
+        for threads in [1, 3, 0] {
+            let pics = common::decode_file_opts(&path, threads, true).unwrap();
+            common::compare(&pics, &reference, f.width as usize, f.height as usize).unwrap();
+            assert!(pics.iter().all(|p| !p.draft && p.chroma_format_idc == 2));
+            let mut decoder = filmcraft_h264::Decoder::with_threads(threads);
+            decoder.decode(&std::fs::read(&path).unwrap(), 0).unwrap();
+            decoder.flush();
+            assert!(decoder.take_error().is_none());
+            let stats = decoder.stats();
+            assert_eq!(stats.pictures, u64::from(f.frames));
+            assert_eq!(stats.slices_i, u64::from(f.frames));
+            assert!(stats.mb_i4x4 + stats.mb_i8x8 + stats.mb_i16x16 > 0);
+        }
+    }
 }

@@ -1,4 +1,4 @@
-//! Deblocking filter (8.7) for progressive frames, 4:2:0, 8 to 10-bit.
+//! Deblocking filter (8.7) for progressive 4:2:0 and intra 4:2:2 frames, 8 to 10-bit.
 
 use crate::picture::{MbKind, MbState, Planes, Sample};
 use crate::slicedec::{PicState, SliceInfo};
@@ -429,6 +429,37 @@ fn filter_chroma_edges<S: Sample>(planes: &mut Planes<S>, m: &MbEdges, max_val: 
     }
 }
 
+/// Filter 4:2:2 chroma at x = 0, 4 and y = 0, 4, 8, 12 (8.7.2).
+/// Chroma coordinates map to luma (2*x, y). Intra internal strengths are 3 even
+/// where an 8x8 luma transform suppresses the luma filtering edge.
+fn filter_chroma_edges_422<S: Sample>(planes: &mut Planes<S>, m: &MbEdges, max_val: i32) {
+    let stride = planes.cwidth;
+    for c in 0..2 {
+        for dir in 0..2 {
+            let count = if dir == 0 { 2 } else { 4 };
+            for ce in 0..count {
+                let e = if dir == 0 { ce * 2 } else { ce };
+                // Only intra pictures are supported for ChromaArrayType 2.
+                let bs = if e == 0 { m.bs[dir][0] } else { [3; 4] };
+                if bs == [0; 4] {
+                    continue;
+                }
+                let qpp = if e == 0 { m.p_qp[dir].map(|p| p.1[c]).unwrap_or(m.q_qpc[c]) } else { m.q_qpc[c] };
+                let ep = edge_params(qpp as i32, m.q_qpc[c] as i32, bs, m.offsets, m.bit_depth);
+                if ep.alpha == 0 || ep.beta == 0 {
+                    continue;
+                }
+                let plane = if c == 0 { &mut planes.cb } else { &mut planes.cr };
+                if dir == 0 {
+                    filter_vertical::<S, 16>(plane, stride, m.mx * 8 + ce * 4, m.my * 16, &ep, true, max_val);
+                } else {
+                    filter_horizontal::<S, 8>(plane, stride, m.mx * 8, m.my * 16 + ce * 4, &ep, true, max_val);
+                }
+            }
+        }
+    }
+}
+
 /// Deblock one macroblock (macroblocks must be processed in raster order).
 pub fn deblock_mb<S: Sample>(pic: &mut PicState<S>, addr: usize, mb_w: usize) {
     let q = &pic.mbs[addr];
@@ -464,7 +495,11 @@ pub fn deblock_mb<S: Sample>(pic: &mut PicState<S>, addr: usize, mb_w: usize) {
         p_qp: [neighbor_qp(left), neighbor_qp(top)],
     };
     filter_luma_edges(&mut pic.planes, &edges, pic.max_val);
-    filter_chroma_edges(&mut pic.planes, &edges, pic.max_val);
+    if pic.planes.mb_height_c == 16 {
+        filter_chroma_edges_422(&mut pic.planes, &edges, pic.max_val);
+    } else {
+        filter_chroma_edges(&mut pic.planes, &edges, pic.max_val);
+    }
 }
 
 #[cfg(test)]
@@ -615,5 +650,52 @@ mod speed {
             dt.as_nanos() as f64 / n as f64,
             pix.iter().map(|&v| v as u64).sum::<u64>()
         );
+    }
+}
+
+#[cfg(test)]
+mod chroma_422_tests {
+    use super::*;
+
+    #[test]
+    fn chroma_422_extra_edges_with_luma_8x8_match_scalar() {
+        let mut planes = Planes::<u8>::new(32, 32, 8, 2);
+        for plane in [&mut planes.cb, &mut planes.cr] {
+            for (i, v) in plane.iter_mut().enumerate() { *v = (90 + (i / 16 / 4) * 3 + i % 16 / 4) as u8; }
+        }
+        let before = planes.cb.clone();
+        let mut reference = before.clone();
+        let edges = MbEdges {
+            bs: intra_mb_bs(true, Some(0), Some(1)),
+            offsets: FilterOffsets { alpha: -4, beta: 4 }, mx: 1, my: 1, bit_depth: 8,
+            q_qp: 40, q_qpc: [37; 2], p_qp: [Some((41, [38; 2])), Some((45, [39; 2]))],
+        };
+        // Each intra edge has uniform strength. Vertical: 16 lines, x = 8,12;
+        // horizontal: 8 columns, y = 16,20,24,28, irrespective of luma t8.
+        for vertical in [true, false] {
+            let positions: &[usize] = if vertical { &[8, 12] } else { &[16, 20, 24, 28] };
+            for (edge, &position) in positions.iter().enumerate() {
+                let bs = if edge == 0 { 4 } else { 3 };
+                let p_qp = if edge == 0 { if vertical { 38 } else { 39 } } else { 37 };
+                let ep = edge_params(p_qp, 37, [bs; 4], edges.offsets, 8);
+                let lines = if vertical { 16 } else { 8 };
+                for line in 0..lines {
+                    let indices: [usize; 8] = std::array::from_fn(|k| {
+                        if vertical { (16 + line) * 16 + position - 4 + k }
+                        else { (position - 4 + k) * 16 + 8 + line }
+                    });
+                    let mut samples = indices.map(|i| reference[i]);
+                    filter8(&mut samples, bs, ep.alpha, ep.beta, ep.tc0[0], true, 255);
+                    for (k, &i) in indices.iter().enumerate() { reference[i] = samples[k]; }
+                }
+            }
+        }
+        filter_chroma_edges_422(&mut planes, &edges, 255);
+        assert_ne!(before, reference);
+        assert_eq!(planes.cb, reference);
+        assert_eq!(planes.cr, reference);
+        for y in [20, 28] {
+            assert_ne!(planes.cb[(y - 1) * 16 + 9], before[(y - 1) * 16 + 9], "extra horizontal edge {y} must be filtered");
+        }
     }
 }

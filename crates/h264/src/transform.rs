@@ -84,6 +84,29 @@ pub fn chroma_dc_dequant_420(c: &mut [i32; 4], qp: i32, ls00: i32) {
     }
 }
 
+/// 4:2:2 chroma DC inverse scan, 2x4 Hadamard and scaling (8.5.11).
+/// `qp` is QP'C; `ls00` uses (QP'C + 3) % 6. Output is raster block order.
+pub fn chroma_dc_dequant_422(c: &mut [i32; 8], qp: i32, ls00: i32) {
+    let scan = [0, 2, 1, 5, 3, 6, 4, 7];
+    let mut t = [[0i32; 2]; 4];
+    for (r, row) in t.iter_mut().enumerate() {
+        let a = c[scan[2 * r]];
+        let b = c[scan[2 * r + 1]];
+        *row = [a.wrapping_add(b), a.wrapping_sub(b)];
+    }
+    let qpdc = qp + 3;
+    for col in 0..2 {
+        let a = t[0][col].wrapping_add(t[1][col]);
+        let b = t[0][col].wrapping_sub(t[1][col]);
+        let d = t[2][col].wrapping_add(t[3][col]);
+        let e = t[2][col].wrapping_sub(t[3][col]);
+        let f = [a.wrapping_add(d), a.wrapping_sub(d), b.wrapping_sub(e), b.wrapping_add(e)];
+        for (r, &v) in f.iter().enumerate() {
+            c[r * 2 + col] = scale8(v, ls00, qpdc);
+        }
+    }
+}
+
 #[inline(always)]
 fn clip<S: Sample>(v: i32, max_val: i32) -> S {
     S::from_i32(v.clamp(0, max_val))
@@ -330,5 +353,45 @@ mod tests {
         let _ = scale4(i32::MAX, 16 * 25, 0);
         let _ = scale8(i32::MIN, 16 * 25, 51);
         let _ = scale8(i32::MIN, 16 * 25, 0);
+    }
+}
+
+#[cfg(test)]
+mod chroma_422_tests {
+    use super::*;
+
+    #[test]
+    fn dc_2x4_matches_matrix_and_scaling() {
+        let a = [[1i64, 1, 1, 1], [1, 1, -1, -1], [1, -1, -1, 1], [1, -1, 1, -1]];
+        let b = [[1i64, 1], [1, -1]];
+        let mut seed = 0x1234_5678u32;
+        for qp in 0..=51 {
+            for _ in 0..32 {
+                let input: [i32; 8] = std::array::from_fn(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((seed >> 16) % 2049) as i32 - 1024
+                });
+                let matrix = [[input[0], input[2]], [input[1], input[5]], [input[3], input[6]], [input[4], input[7]]];
+                let qpdc = qp + 3;
+                let ls = 16 * norm_adjust4((qpdc % 6) as usize, 0) as i32;
+                let mut got = input;
+                chroma_dc_dequant_422(&mut got, qp, ls);
+                for r in 0..4 {
+                    for col in 0..2 {
+                        let mut f = 0i64;
+                        for i in 0..4 {
+                            for j in 0..2 {
+                                f += a[r][i] * i64::from(matrix[i][j]) * b[j][col];
+                            }
+                        }
+                        let product = f * i64::from(ls);
+                        let expected = if qpdc >= 36 { product << (qpdc / 6 - 6) } else {
+                            (product + (1 << (5 - qpdc / 6))) >> (6 - qpdc / 6)
+                        };
+                        assert_eq!(i64::from(got[r * 2 + col]), expected, "QP'C {qp}, row {r}, col {col}");
+                    }
+                }
+            }
+        }
     }
 }

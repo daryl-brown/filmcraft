@@ -1,7 +1,7 @@
 # filmcraft-h264
 
 Clean-room, pure-Rust (no `unsafe`) H.264 / AVC decoder, implemented from the public ITU-T
-Rec. H.264 (ISO/IEC 14496-10) specification. It is an L0 crate: it depends only on
+Rec. H.264 (06/2026, ISO/IEC 14496-10) specification. It is an L0 crate: it depends only on
 `filmcraft-bitstream`, `thiserror`, and optionally `rayon` (default feature `threads`), and builds
 for `wasm32-unknown-unknown`.
 
@@ -13,17 +13,22 @@ oracles and fixture generators.
 
 ## Supported
 
+Progressive 8 to 10-bit 4:2:0 supports I/P/B slices. High 4:2:2 and High 4:2:2
+Intra support 8 to 10-bit 4:2:2 I slices only, with CAVLC or CABAC and luma 4x4
+or 8x8 transforms. Inter prediction for 4:2:2, 4:4:4, separate colour planes and
+transform bypass return unsupported errors.
+
 - NAL units: Annex-B byte streams and length-prefixed (`avcC`) samples; SPS (all fields incl.
   VUI/HRD, scaling lists with fall-back rules A/B, cropping, high-profile fields), PPS (incl.
   `transform_8x8_mode`, scaling lists, slice groups parsed), SEI / AUD / filler skipped.
 - Slice header: all fields incl. reference list modification, prediction weight table and
   decoded reference picture marking. POC types 0, 1, 2. `frame_num` gap handling ("non-existing"
   frames).
-- Entropy coding: CAVLC and CABAC (all syntax elements needed for frame coding, 4:2:0).
+- Entropy coding: CAVLC and CABAC (all syntax elements needed for frame coding, 4:2:0 and intra 4:2:2).
 - Macroblocks: I (Intra 4x4 / 8x8 / 16x16, I_PCM), P (all partitions, P_8x8ref0, P_Skip),
   B (all partitions and sub-partitions, B_Skip, B_Direct_16x16, B_Direct_8x8), spatial and temporal
   direct prediction with/without `direct_8x8_inference`, constrained intra prediction.
-- Transforms / quantisation: 4x4, 8x8, Intra16x16 DC Hadamard, 2x2 chroma DC; flat and custom
+- Transforms / quantisation: 4x4, 8x8, Intra16x16 DC Hadamard, 2x2 / 2x4 chroma DC; flat and custom
   scaling matrices (SPS and PPS level).
 - Inter prediction: quarter-sample 6-tap luma, eighth-sample chroma, explicit and implicit weighted
   prediction, multiple reference frames, long-term references.
@@ -31,7 +36,7 @@ oracles and fixture generators.
   the level (or VUI `max_dec_frame_buffering`) and `max_num_reorder_frames`.
 - Deblocking filter: full bS derivation, `disable_deblocking_filter_idc` 0/1/2, slice offsets,
   8x8-transform edges.
-- Output: cropped planar 4:2:0 pictures with 8 to 10-bit storage (u8 at 8 bits, u16 above 8 bits), in output order with the caller's `pts`, POC, key flag, VUI colour description (range,
+- Output: cropped planar 4:2:0 or 4:2:2 pictures with 8 to 10-bit storage (u8 at 8 bits, u16 above 8 bits), in output order with the caller's `pts`, POC, key flag, VUI colour description (range,
   primaries, transfer, matrix) and sample aspect ratio.
 - Frame-level multithreading (see below).
 - Draft mode for reduced-resolution playback (off by default): non-reference pictures skip the
@@ -204,7 +209,7 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 
 - Interlaced coding (field pictures, PAFF, MBAFF): streams with `frame_mbs_only_flag = 0` return
   `Error::Unsupported`.
-- Only 8 to 10-bit 4:2:0 with equal luma and chroma depths. 4:2:2 / 4:4:4 / monochrome and lossless
+- Only 8 to 10-bit with equal luma and chroma depths. 4:2:2 inter prediction, 4:4:4, monochrome and lossless
   (`qpprime_y_zero_transform_bypass`) return `Error::Unsupported`.
 - FMO (slice groups), SP/SI slices, data partitioning (Extended profile), MVC/SVC NAL units.
 - Error concealment is minimal: undecodable slices leave the prediction/previous content; missing
@@ -212,13 +217,11 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 - No SIMD intrinsics (the hot loops are written to auto-vectorise); CABAC residual decoding is
   inherently serial and now dominates.
 
-### Extending to 4:2:2
+### Chroma formats
 
-The chroma format and bit depth are isolated behind `Sps::check_supported`. `Planes` and
-`FrameRow` use a generic sample type, with `u8` storage for 8-bit pictures and `u16` storage for
-higher bit depths. QP derivations include `QpBdOffset`; deblocking scales tC0/alpha/beta. The remaining
-format-specific parts are chroma block geometry (`MbWidthC` / `MbHeightC` = 8x8 in `slicedec`,
-`intra::pred_chroma`, the chroma DC transform and the CABAC/CAVLC chroma DC parsing; the 2x4
-total_zeros tables and ctxBlockCat 3 `NumC8x8` handling are already in place), chroma
-motion-vector vertical scaling and the chroma deblocking edges (4:2:2 has four horizontal
-chroma edges).
+`Picture::chroma_format_idc` identifies 4:2:0 (1) or 4:2:2 (2). Chroma planes are
+half the luma width and, for 4:2:2, the full luma height. `Planes` and published
+`Frame` rows carry the chroma macroblock height (8 or 16). The 4:2:0 DC transform
+and deblocking path remain separate; 4:2:2 uses eight chroma blocks per component,
+a 2x4 DC transform and four horizontal chroma filtering edges. The 8x8 transform
+applies to luma only. P/B 4:2:2 slices are rejected in the slice header.
