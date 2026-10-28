@@ -49,22 +49,22 @@ pub fn luma_dc_dequant(c: &mut [i32; 16], qp: i32, ls00: i32) {
     // rows
     for i in 0..4 {
         let r = &c[i * 4..i * 4 + 4];
-        let s01 = r[0] + r[1];
-        let d01 = r[0] - r[1];
-        let s23 = r[2] + r[3];
-        let d23 = r[2] - r[3];
-        t[i * 4] = s01 + s23;
-        t[i * 4 + 1] = s01 - s23;
-        t[i * 4 + 2] = d01 - d23;
-        t[i * 4 + 3] = d01 + d23;
+        let s01 = r[0].wrapping_add(r[1]);
+        let d01 = r[0].wrapping_sub(r[1]);
+        let s23 = r[2].wrapping_add(r[3]);
+        let d23 = r[2].wrapping_sub(r[3]);
+        t[i * 4] = s01.wrapping_add(s23);
+        t[i * 4 + 1] = s01.wrapping_sub(s23);
+        t[i * 4 + 2] = d01.wrapping_sub(d23);
+        t[i * 4 + 3] = d01.wrapping_add(d23);
     }
     // columns
     for j in 0..4 {
-        let s01 = t[j] + t[4 + j];
-        let d01 = t[j] - t[4 + j];
-        let s23 = t[8 + j] + t[12 + j];
-        let d23 = t[8 + j] - t[12 + j];
-        let f = [s01 + s23, s01 - s23, d01 - d23, d01 + d23];
+        let s01 = t[j].wrapping_add(t[4 + j]);
+        let d01 = t[j].wrapping_sub(t[4 + j]);
+        let s23 = t[8 + j].wrapping_add(t[12 + j]);
+        let d23 = t[8 + j].wrapping_sub(t[12 + j]);
+        let f = [s01.wrapping_add(s23), s01.wrapping_sub(s23), d01.wrapping_sub(d23), d01.wrapping_add(d23)];
         for i in 0..4 {
             c[i * 4 + j] =
                 if qp >= 36 { f[i].wrapping_mul(ls00) << (qp / 6 - 6) } else { f[i].wrapping_mul(ls00).wrapping_add(1 << (5 - qp / 6)) >> (6 - qp / 6) };
@@ -97,29 +97,29 @@ pub fn idct4_add<S: Sample>(d: &[i32; 16], dst: &mut [S], stride: usize, max_val
     let mut t = [[0i32; 4]; 4];
     for (i, row) in t.iter_mut().enumerate() {
         let r = &d[i * 4..i * 4 + 4];
-        let e = r[0] + r[2];
-        let f = r[0] - r[2];
-        let g = (r[1] >> 1) - r[3];
-        let h = r[1] + (r[3] >> 1);
-        *row = [e + h, f + g, f - g, e - h];
+        let e = r[0].wrapping_add(r[2]);
+        let f = r[0].wrapping_sub(r[2]);
+        let g = (r[1] >> 1).wrapping_sub(r[3]);
+        let h = r[1].wrapping_add(r[3] >> 1);
+        *row = [e.wrapping_add(h), f.wrapping_add(g), f.wrapping_sub(g), e.wrapping_sub(h)];
     }
     let mut o = [[0i32; 4]; 4];
     for j in 0..4 {
-        let e = t[0][j] + t[2][j];
-        let f = t[0][j] - t[2][j];
-        let g = (t[1][j] >> 1) - t[3][j];
-        let h = t[1][j] + (t[3][j] >> 1);
-        o[0][j] = e + h;
-        o[1][j] = f + g;
-        o[2][j] = f - g;
-        o[3][j] = e - h;
+        let e = t[0][j].wrapping_add(t[2][j]);
+        let f = t[0][j].wrapping_sub(t[2][j]);
+        let g = (t[1][j] >> 1).wrapping_sub(t[3][j]);
+        let h = t[1][j].wrapping_add(t[3][j] >> 1);
+        o[0][j] = e.wrapping_add(h);
+        o[1][j] = f.wrapping_add(g);
+        o[2][j] = f.wrapping_sub(g);
+        o[3][j] = e.wrapping_sub(h);
     }
     for (i, row) in o.iter().enumerate() {
         let Some(line) = dst.get_mut(i * stride..).and_then(|d| d.first_chunk_mut::<4>()) else {
             return;
         };
         for (p, &v) in line.iter_mut().zip(row) {
-            *p = clip(p.to_i32() + ((v + 32) >> 6), max_val);
+            *p = clip(p.to_i32().wrapping_add(v.wrapping_add(32) >> 6), max_val);
         }
     }
 }
@@ -127,33 +127,34 @@ pub fn idct4_add<S: Sample>(d: &[i32; 16], dst: &mut [S], stride: usize, max_val
 /// DC-only shortcut: all AC coefficients zero.
 #[allow(dead_code)]
 pub fn idct4_dc_add<S: Sample>(dc: i32, dst: &mut [S], stride: usize, max_val: i32) {
-    let v = (dc + 32) >> 6;
+    let v = dc.wrapping_add(32) >> 6;
     for i in 0..4 {
         for p in &mut dst[i * stride..i * stride + 4] {
-            *p = clip(p.to_i32() + v, max_val);
+            *p = clip(p.to_i32().wrapping_add(v), max_val);
         }
     }
 }
 
 #[inline(always)]
 fn idct8_1d(d: [i32; 8]) -> [i32; 8] {
-    let a0 = d[0] + d[4];
-    let a4 = d[0] - d[4];
-    let a2 = (d[2] >> 1) - d[6];
-    let a6 = d[2] + (d[6] >> 1);
-    let b0 = a0 + a6;
-    let b2 = a4 + a2;
-    let b4 = a4 - a2;
-    let b6 = a0 - a6;
-    let a1 = -d[3] + d[5] - d[7] - (d[7] >> 1);
-    let a3 = d[1] + d[7] - d[3] - (d[3] >> 1);
-    let a5 = -d[1] + d[7] + d[5] + (d[5] >> 1);
-    let a7 = d[3] + d[5] + d[1] + (d[1] >> 1);
-    let b1 = a1 + (a7 >> 2);
-    let b7 = a7 - (a1 >> 2);
-    let b3 = a3 + (a5 >> 2);
-    let b5 = (a3 >> 2) - a5;
-    [b0 + b7, b2 + b5, b4 + b3, b6 + b1, b6 - b1, b4 - b3, b2 - b5, b0 - b7]
+    let a0 = d[0].wrapping_add(d[4]);
+    let a4 = d[0].wrapping_sub(d[4]);
+    let a2 = (d[2] >> 1).wrapping_sub(d[6]);
+    let a6 = d[2].wrapping_add(d[6] >> 1);
+    let b0 = a0.wrapping_add(a6);
+    let b2 = a4.wrapping_add(a2);
+    let b4 = a4.wrapping_sub(a2);
+    let b6 = a0.wrapping_sub(a6);
+    let a1 = d[3].wrapping_neg().wrapping_add(d[5]).wrapping_sub(d[7]).wrapping_sub(d[7] >> 1);
+    let a3 = d[1].wrapping_add(d[7]).wrapping_sub(d[3]).wrapping_sub(d[3] >> 1);
+    let a5 = d[1].wrapping_neg().wrapping_add(d[7]).wrapping_add(d[5]).wrapping_add(d[5] >> 1);
+    let a7 = d[3].wrapping_add(d[5]).wrapping_add(d[1]).wrapping_add(d[1] >> 1);
+    let b1 = a1.wrapping_add(a7 >> 2);
+    let b7 = a7.wrapping_sub(a1 >> 2);
+    let b3 = a3.wrapping_add(a5 >> 2);
+    let b5 = (a3 >> 2).wrapping_sub(a5);
+    [b0.wrapping_add(b7), b2.wrapping_add(b5), b4.wrapping_add(b3), b6.wrapping_add(b1),
+     b6.wrapping_sub(b1), b4.wrapping_sub(b3), b2.wrapping_sub(b5), b0.wrapping_sub(b7)]
 }
 
 /// Inverse 8x8 transform of raster-order `d` and add to `dst` (8.5.13.2): rows, then columns,
@@ -175,7 +176,7 @@ pub fn idct8_add<S: Sample>(d: &[i32; 64], dst: &mut [S], stride: usize, max_val
             return;
         };
         for (p, &v) in line.iter_mut().zip(row) {
-            *p = clip(p.to_i32() + ((v + 32) >> 6), max_val);
+            *p = clip(p.to_i32().wrapping_add(v.wrapping_add(32) >> 6), max_val);
         }
     }
 }
@@ -203,6 +204,34 @@ mod tests {
                 *p = (*p as i32 + ((col[i] + 32) >> 6)).clamp(0, 255) as u8;
             }
         }
+    }
+
+    #[test]
+    fn ten_bit_primed_qp_and_reconstruction_range() {
+        assert_eq!(scale4(1, 160, 63), 10240);
+        assert_eq!(scale8(1, 320, 63), 5120);
+        let mut dc = [0; 16];
+        dc[0] = scale4(1, 160, 63);
+        let mut pixels = [512u16; 16];
+        idct4_add(&dc, &mut pixels, 4, 1023);
+        assert_eq!(pixels, [672; 16]);
+        dc[0] = 64 * 2048;
+        idct4_add(&dc, &mut pixels, 4, 1023);
+        assert_eq!(pixels, [1023; 16]);
+        dc[0] = -64 * 2048;
+        idct4_add(&dc, &mut pixels, 4, 1023);
+        assert_eq!(pixels, [0; 16]);
+    }
+
+    #[test]
+    fn hostile_transform_data_never_overflows() {
+        let mut dc = [i32::MAX; 16];
+        luma_dc_dequant(&mut dc, 63, 255 * 25);
+        let mut pixels = [512u16; 64];
+        idct4_add(&dc, &mut pixels, 8, 1023);
+        let large = std::array::from_fn(|i| if i % 2 == 0 { i32::MIN } else { i32::MAX });
+        idct8_add(&large, &mut pixels, 8, 1023);
+        assert!(pixels.iter().all(|&v| v <= 1023));
     }
 
     #[test]

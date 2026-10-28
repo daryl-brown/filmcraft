@@ -201,6 +201,30 @@ mod tests {
     }
 
     #[test]
+    fn extended_level_prefix_and_limit() {
+        for prefix in [15, 16, 25, 26] {
+            let mut w = BitWriter::new();
+            let token = COEFF_TOKEN.iter().find(|e| e.0 == 0 && e.1 == 1).unwrap().2[0];
+            write_code(&mut w, token);
+            w.write_bits(0, prefix);
+            w.write_bit(true);
+            w.write_bits(0, prefix - 3);
+            write_code(&mut w, TOTAL_ZEROS_4X4[0][0]);
+            w.rbsp_trailing();
+            let bytes = w.finish();
+            let mut coeff = [0i32; 16];
+            let result = residual_block(&mut BitReader::new(&bytes), &mut coeff, 0, 15, 16, 0);
+            if prefix > 25 {
+                assert!(result.is_err());
+            } else {
+                assert_eq!(result.unwrap(), 1);
+                let code = 15 + 15 + 2 + if prefix >= 16 { (1 << (prefix - 3)) - 4096 } else { 0 };
+                assert_eq!(coeff[0], (code + 2) >> 1);
+            }
+        }
+    }
+
+    #[test]
     fn coeff_token_tables_are_prefix_codes() {
         for col in 0..6 {
             let codes: Vec<&str> = COEFF_TOKEN.iter().map(|e| e.2[col]).collect();

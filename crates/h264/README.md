@@ -31,8 +31,7 @@ oracles and fixture generators.
   the level (or VUI `max_dec_frame_buffering`) and `max_num_reorder_frames`.
 - Deblocking filter: full bS derivation, `disable_deblocking_filter_idc` 0/1/2, slice offsets,
   8x8-transform edges.
-- Output: cropped planar 4:2:0 pictures with bit-depth-generic storage (supported streams remain
-  8-bit), in output order with the caller's `pts`, POC, key flag, VUI colour description (range,
+- Output: cropped planar 4:2:0 pictures with 8 to 10-bit storage (u8 at 8 bits, u16 above 8 bits), in output order with the caller's `pts`, POC, key flag, VUI colour description (range,
   primaries, transfer, matrix) and sample aspect ratio.
 - Frame-level multithreading (see below).
 - Draft mode for reduced-resolution playback (off by default): non-reference pictures skip the
@@ -56,8 +55,8 @@ for pic in dec.flush() { /* ... */ }
 if let Some(err) = dec.take_error() { /* error reported by a decoding thread */ }
 ```
 
-`decode` expects whole access units (a buffer with several complete access units — e.g. an
-entire Annex-B file — also works). `Decoder::stats()` returns counters of the coding tools seen
+`decode` expects whole access units (a buffer with several complete access units, such as an
+entire Annex-B file, also works). `Decoder::stats()` returns counters of the coding tools seen
 (macroblock types, slice types, MMCOs, long-term marks, frame_num gaps, ...).
 
 ### Threading model
@@ -105,7 +104,7 @@ with ffmpeg + libx264; tests print a message and skip when `/opt/homebrew/bin/ff
   values, transforms, luma interpolation against a straightforward reference implementation,
   weighting, macroblock type tables, scaling-list parsing.
 - Synthetic streams (`src/synth_tests.rs`): hand-built CAVLC and CABAC bitstreams covering what
-  libx264 never produces — I_PCM, long-term references, MMCO 1-6, `frame_num` gaps, reference list
+  libx264 never produces: I_PCM, long-term references, MMCO 1-6, `frame_num` gaps, reference list
   modification (short- and long-term), explicit weighted prediction in P and B slices, B_Skip with
   explicit bi-prediction. The expected output is known exactly and is also checked against ffmpeg.
 - Robustness: avcC input with pts round trip; randomly corrupted, truncated and garbage input never
@@ -190,7 +189,7 @@ of the playback benchmark's `a2160.mp4`), CPU cycles per frame counted by the ke
 | M4.9 | **390** (−23 %) | 1195 M |
 | M4.9, draft mode | **356** (−30 %) | 1068 M |
 
-The same on the benchmark's 1080p fixture (`dec_h264_1080.mp4`, 120 frames): 132 → 100 Mcycles
+The same on the benchmark's 1080p fixture (`dec_h264_1080.mp4`, 120 frames): 132 to 100 Mcycles
 per frame (−24 %), 90 in draft mode. Single-threaded 4K time (`sample` profile) splits into CABAC
 residual decoding 41 %, deblocking 16 % (25-30 % before), other macroblock-layer parsing 11 %,
 inverse transforms and dequantisation 9 %, motion compensation 8 %, intra prediction 6 %, row and
@@ -205,7 +204,7 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 
 - Interlaced coding (field pictures, PAFF, MBAFF): streams with `frame_mbs_only_flag = 0` return
   `Error::Unsupported`.
-- Only 8-bit 4:2:0. High 10 / 4:2:2 / 4:4:4 / monochrome and lossless
+- Only 8 to 10-bit 4:2:0 with equal luma and chroma depths. 4:2:2 / 4:4:4 / monochrome and lossless
   (`qpprime_y_zero_transform_bypass`) return `Error::Unsupported`.
 - FMO (slice groups), SP/SI slices, data partitioning (Extended profile), MVC/SVC NAL units.
 - Error concealment is minimal: undecodable slices leave the prediction/previous content; missing
@@ -213,12 +212,11 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 - No SIMD intrinsics (the hot loops are written to auto-vectorise); CABAC residual decoding is
   inherently serial and now dominates.
 
-### Extending to High 10 and 4:2:2
+### Extending to 4:2:2
 
 The chroma format and bit depth are isolated behind `Sps::check_supported`. `Planes` and
 `FrameRow` use a generic sample type, with `u8` storage for 8-bit pictures and `u16` storage for
-higher bit depths. Stream support remains 8-bit 4:2:0. Higher bit depth semantics still need
-`QpBdOffset` in the QP derivations and scaled tC0/alpha/beta in deblocking. The remaining
+higher bit depths. QP derivations include `QpBdOffset`; deblocking scales tC0/alpha/beta. The remaining
 format-specific parts are chroma block geometry (`MbWidthC` / `MbHeightC` = 8x8 in `slicedec`,
 `intra::pred_chroma`, the chroma DC transform and the CABAC/CAVLC chroma DC parsing; the 2x4
 total_zeros tables and ctxBlockCat 3 `NumC8x8` handling are already in place), chroma

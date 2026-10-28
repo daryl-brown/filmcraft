@@ -20,7 +20,7 @@ pub trait Sample: Copy + Default + PartialEq + std::fmt::Debug + Send + Sync + '
     fn from_u16(v: u16) -> Self;
     /// The rows of `f` if they are stored with this type.
     fn rows(f: &Frame) -> Option<&[OnceLock<FrameRow<Self>>]>;
-    fn copy_pcm(dst: &mut [Self], src: &[u8]);
+    fn copy_pcm(dst: &mut [Self], src: &[u16]);
     fn allocator() -> fn(usize) -> Vec<Self>;
     fn wrap_plane(samples: Vec<Self>) -> crate::Plane;
     fn plane_samples(plane: crate::Plane) -> Option<Vec<Self>>;
@@ -73,8 +73,10 @@ impl Sample for u8 {
         }
     }
     #[inline(always)]
-    fn copy_pcm(dst: &mut [Self], src: &[u8]) {
-        dst.copy_from_slice(src);
+    fn copy_pcm(dst: &mut [Self], src: &[u16]) {
+        for (d, &v) in dst.iter_mut().zip(src) {
+            *d = v as u8;
+        }
     }
     fn allocator() -> fn(usize) -> Vec<Self> {
         plane_allocator()
@@ -139,10 +141,8 @@ impl Sample for u16 {
         }
     }
     #[inline(always)]
-    fn copy_pcm(dst: &mut [Self], src: &[u8]) {
-        for (d, &v) in dst.iter_mut().zip(src) {
-            *d = v as u16;
-        }
+    fn copy_pcm(dst: &mut [Self], src: &[u16]) {
+        dst.copy_from_slice(src);
     }
     fn allocator() -> fn(usize) -> Vec<Self> {
         Vec::with_capacity
@@ -228,9 +228,10 @@ pub struct MbState {
     pub transform_8x8: bool,
     /// coded_block_pattern: bits 0..3 luma, bits 4..5 chroma.
     pub cbp: u8,
-    pub qp: u8,
+    /// Unprimed QPY (7.4.5), including negative values at higher bit depths.
+    pub qp: i8,
     /// QPc for Cb / Cr (used by deblocking).
-    pub qpc: [u8; 2],
+    pub qpc: [i8; 2],
     pub intra_chroma_mode: u8,
     /// Intra4x4PredMode / Intra8x8PredMode per 4x4 block (raster order).
     pub intra_modes: [u8; 16],

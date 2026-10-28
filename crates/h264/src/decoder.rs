@@ -1,8 +1,8 @@
 //! Top-level decoder: NAL dispatch, picture boundaries, POC, DPB and output.
 //!
 //! The calling thread parses headers and does all DPB / reference list bookkeeping (which only needs
-//! header information). Macroblock decoding of each picture runs as a job — on a thread pool with the
-//! `threads` feature — that publishes finished macroblock rows into the picture's shared [`Frame`];
+//! header information). Macroblock decoding of each picture runs as a job (on a thread pool with the
+//! `threads` feature) that publishes finished macroblock rows into the picture's shared [`Frame`];
 //! jobs of later pictures block per row on the reference data they need, so several pictures decode
 //! concurrently (frame-level parallelism).
 
@@ -406,6 +406,12 @@ impl Decoder {
     }
 
     fn start_picture(&mut self, sh: &SliceHeader, sps: &Arc<Sps>, pts: i64) -> Result<()> {
+        if !sh.idr && let Some(active) = &self.active_sps {
+            ensure!(
+                active.bit_depth_luma == sps.bit_depth_luma && active.bit_depth_chroma == sps.bit_depth_chroma,
+                "bit depth change requires an IDR picture"
+            );
+        }
         // Activate SPS; a resolution change flushes the DPB.
         let changed = match &self.active_sps {
             None => true,

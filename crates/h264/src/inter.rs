@@ -245,7 +245,7 @@ pub fn mc_chroma<S: Sample>(p: PlaneRef<'_, S>, x: i32, y: i32, blk: McBlock, ou
 /// position of the block.
 pub fn mc_chroma_win<S: Sample>(src: &[S], ss: usize, blk: McBlock, out: &mut [S], os: usize) {
     let McBlock { fx, fy, bw, bh } = blk;
-    let (fx, fy) = (fx as u16, fy as u16);
+    let (fx, fy) = (fx as i32, fy as i32);
     let (w00, w10, w01, w11) = ((8 - fx) * (8 - fy), fx * (8 - fy), (8 - fx) * fy, fx * fy);
     if fx == 0 && fy == 0 {
         for r in 0..bh {
@@ -258,8 +258,8 @@ pub fn mc_chroma_win<S: Sample>(src: &[S], ss: usize, blk: McBlock, out: &mut [S
         let r1 = &src[(r + 1) * ss..(r + 1) * ss + bw + 1];
         let o = &mut out[r * os..r * os + bw];
         for (c, o) in o.iter_mut().enumerate() {
-            let v = w00 * r0[c].to_u16() + w10 * r0[c + 1].to_u16() + w01 * r1[c].to_u16() + w11 * r1[c + 1].to_u16();
-            *o = S::from_u16((v + 32) >> 6);
+            let v = w00 * r0[c].to_i32() + w10 * r0[c + 1].to_i32() + w01 * r1[c].to_i32() + w11 * r1[c + 1].to_i32();
+            *o = S::from_i32((v + 32) >> 6);
         }
     }
 }

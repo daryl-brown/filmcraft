@@ -18,6 +18,22 @@ macro_rules! fixture_tests {
 }
 
 fixture_tests!(
+    h10_intra_cabac0_t0,
+    h10_intra_cabac0_t1,
+    h10_intra_cabac1_t0,
+    h10_intra_cabac1_t1,
+    h10_cqm,
+    h10_qp1,
+    h10_qp50,
+    h10_nodeblock,
+    h10_deblock,
+    h10_slices,
+    h10_chroma_m6,
+    h10_chroma_p6,
+    h10_crop,
+    h10_bpyramid,
+    h10_weighted,
+    h10_temporal,
     intra_cavlc,
     intra_cavlc_noise,
     intra_cavlc_8x8,
@@ -62,7 +78,7 @@ fixture_tests!(
 #[test]
 fn draft_mode_changes_only_flagged_non_reference_pictures() {
     let mut checked = 0;
-    for name in ["main_cabac_b", "bpyramid", "cavlc_b", "direct_temporal", "weightb"] {
+    for name in ["main_cabac_b", "bpyramid", "cavlc_b", "direct_temporal", "weightb", "h10_bpyramid", "h10_weighted"] {
         let f = common::fixture(name);
         let Some((h264, yuv)) = common::ensure(f) else {
             eprintln!("skipped {name}");
@@ -70,7 +86,7 @@ fn draft_mode_changes_only_flagged_non_reference_pictures() {
         };
         let reference = std::fs::read(&yuv).unwrap();
         let (w, h) = (f.width as usize, f.height as usize);
-        let fsize = w * h + 2 * w.div_ceil(2) * h.div_ceil(2);
+        let fsize = (w * h + 2 * w.div_ceil(2) * h.div_ceil(2)) * if f.pix_fmt == "yuv420p" { 1 } else { 2 };
         for threads in [1, 0] {
             let pics = common::decode_file_opts(&h264, threads, true).unwrap_or_else(|(au, e, _)| panic!("{name}: error at {au}: {e}"));
             common::check_pts(&pics).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -78,7 +94,7 @@ fn draft_mode_changes_only_flagged_non_reference_pictures() {
             let (mut draft, mut changed) = (0, 0);
             for (i, p) in pics.iter().enumerate() {
                 let r = &reference[i * fsize..(i + 1) * fsize];
-                let same = p.y.as_u8().unwrap() == &r[..w * h] && [p.u.as_u8().unwrap(), p.v.as_u8().unwrap()].concat() == r[w * h..];
+                let same = common::compare(std::slice::from_ref(p), r, w, h).is_ok();
                 if p.draft {
                     draft += 1;
                     changed += !same as usize;
@@ -158,7 +174,7 @@ fn concurrent_fixture_publication_is_safe() {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     let name = Box::leak(format!("concurrent_fixture_{}_{stamp}", std::process::id()).into_boxed_str());
     let fixture =
-        common::Fixture { name, source: "testsrc2", width: 64, height: 48, frames: 2, filter: "", args: &["-preset", "ultrafast", "-x264-params", "keyint=1"] };
+        common::Fixture { pix_fmt: "yuv420p", name, source: "testsrc2", width: 64, height: 48, frames: 2, filter: "", args: &["-preset", "ultrafast", "-x264-params", "keyint=1"] };
     let open_published = |path: &std::path::Path| {
         let mut options = std::fs::OpenOptions::new();
         options.read(true);

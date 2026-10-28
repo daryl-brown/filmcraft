@@ -115,6 +115,10 @@ impl Pic {
 }
 
 fn slice_header(w: &mut BitWriter, p: &Pic, cabac: bool) {
+    slice_header_qp(w, p, cabac, 0);
+}
+
+fn slice_header_qp(w: &mut BitWriter, p: &Pic, cabac: bool, qp_delta: i32) {
     w.write_ue(0); // first_mb
     w.write_ue(if p.b {
         6
@@ -193,7 +197,7 @@ fn slice_header(w: &mut BitWriter, p: &Pic, cabac: bool) {
     if cabac && p.inter() {
         w.write_ue(0); // cabac_init_idc
     }
-    w.write_se(0); // slice_qp_delta
+    w.write_se(qp_delta); // slice_qp_delta
     w.write_ue(0); // disable_deblocking_filter_idc
     w.write_se(0);
     w.write_se(0);
@@ -635,5 +639,227 @@ fn sample_storage_deblock_matches() {
     let wide = filtered::<u16>();
     for (a, b) in [(&narrow.y, &wide.y), (&narrow.cb, &wide.cb), (&narrow.cr, &wide.cr)] {
         assert_eq!(a.iter().copied().map(u16::from).collect::<Vec<_>>(), *b);
+    }
+}
+
+/// High-profile SPS with POC type 2 and the same macroblock geometry as the baseline helper.
+fn depth_sps(luma: u32, chroma: u32, format: u32, bypass: bool) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.write_bits(110, 8);
+    w.write_bits(0, 8);
+    w.write_bits(30, 8);
+    w.write_ue(0);
+    w.write_ue(format);
+    if format == 3 { w.write_bit(false); }
+    w.write_ue(luma - 8);
+    w.write_ue(chroma - 8);
+    w.write_bit(bypass);
+    w.write_bit(false); // scaling matrix
+    w.write_ue(0); // log2_max_frame_num_minus4
+    w.write_ue(2); // poc type
+    w.write_ue(1); // reference frames
+    w.write_bit(false); // gaps
+    w.write_ue(MB_W as u32 - 1);
+    w.write_ue(MB_H as u32 - 1);
+    w.write_bit(true);
+    w.write_bit(true);
+    w.write_bit(false); // cropping
+    w.write_bit(false); // vui
+    w.rbsp_trailing();
+    nal(3, 7, &w.finish())
+}
+
+#[test]
+fn sps_depth_support_and_rejections() {
+    for (y, c, format, bypass, accepted) in [
+        (8, 8, 1, false, true), (9, 9, 1, false, true), (10, 10, 1, false, true),
+        (11, 11, 1, false, false), (9, 10, 1, false, false), (10, 9, 1, false, false),
+        (10, 10, 2, false, false), (10, 10, 3, false, false), (10, 10, 1, true, false),
+    ] {
+        let bytes = depth_sps(y, c, format, bypass);
+        let mut parsed = crate::params::Sps::parse(&filmcraft_bitstream::unescape_rbsp(&bytes[5..])).unwrap();
+        for profile in [110, 122] {
+            parsed.profile_idc = profile;
+            let result = parsed.check_supported();
+            if accepted {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(crate::Error::Unsupported(_))));
+            }
+        }
+    }
+}
+
+fn depth_pcm_slice(depth: u32, cabac: bool, idr: bool, frame_num: u32) -> Vec<u8> {
+    let p = Pic { idr, frame_num, ref_idc: 3, ..Default::default() };
+    let mut w = BitWriter::new();
+    slice_header(&mut w, &p, cabac);
+    if cabac {
+        while !w.is_byte_aligned() { w.write_bit(true); }
+    }
+    let mut e = Enc::new(26, 3);
+    for mb in 0..NMB {
+        if cabac {
+            let inc = (mb % MB_W > 0) as usize + (mb >= MB_W) as usize;
+            e.encode(&mut w, 3 + inc, 1);
+            e.terminate(&mut w, true);
+        } else {
+            w.write_ue(25);
+        }
+        w.align_zero();
+        for k in 0..384 {
+            w.write_bits(((k + mb * 17) as u32 * 37) & ((1 << depth) - 1), depth);
+        }
+        if cabac {
+            e.init();
+            e.terminate(&mut w, mb + 1 == NMB);
+        }
+    }
+    if cabac { w.align_zero(); } else { w.rbsp_trailing(); }
+    nal(3, if idr { 5 } else { 1 }, &w.finish())
+}
+
+#[test]
+fn pcm_nine_and_ten_bit_cavlc_and_cabac() {
+    for depth in [9, 10] {
+        for cabac in [false, true] {
+            let mut stream = depth_sps(depth, depth, 1, false);
+            stream.extend(pps(cabac, false));
+            stream.extend(depth_pcm_slice(depth, cabac, true, 0));
+            let mut dec = Decoder::with_threads(1);
+            let mut pics = dec.decode(&stream, 0).unwrap();
+            pics.extend(dec.flush());
+            assert!(dec.take_error().is_none());
+            assert_eq!(pics.len(), 1);
+            let p = &pics[0];
+            assert_eq!(p.bit_depth, depth);
+            for (plane, first, side) in [(&p.y, 0, 16), (&p.u, 256, 8), (&p.v, 320, 8)] {
+                let values = plane.as_u16().unwrap();
+                let stride = MB_W * side;
+                for mb in 0..NMB {
+                    for k in 0..side * side {
+                        let index = (mb / MB_W * side + k / side) * stride + mb % MB_W * side + k % side;
+                        let expected = (((first + k + mb * 17) as u32 * 37) & ((1 << depth) - 1)) as u16;
+                        assert_eq!(values[index], expected, "depth {depth}, cabac {cabac}, mb {mb}, sample {k}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn truncated_ten_bit_pcm_returns_error() {
+    let mut w = BitWriter::new();
+    for k in 0..384 { w.write_bits(k, 10); }
+    let bytes = w.finish();
+    for len in 0..bytes.len() {
+        let result = std::panic::catch_unwind(|| {
+            crate::slicedec::read_pcm(&mut filmcraft_bitstream::BitReader::new(&bytes[..len]), 10)
+        });
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_err());
+    }
+}
+
+#[test]
+fn reference_depth_change_without_idr_is_rejected() {
+    for (old_depth, new_depth) in [(8, 10), (9, 10), (10, 9), (10, 8)] {
+        let mut dec = Decoder::with_threads(1);
+        let mut first = depth_sps(old_depth, old_depth, 1, false);
+        first.extend(pps(false, false));
+        first.extend(depth_pcm_slice(old_depth, false, true, 0));
+        dec.decode(&first, 0).unwrap();
+        let mut next = depth_sps(new_depth, new_depth, 1, false);
+        next.extend(pps(false, false));
+        // A P_Skip picture references the previous IDR at the old depth.
+        next.extend(slice_nal(&Pic { frame_num: 1, ref_idc: 3, mbs: vec![None; NMB], ..Default::default() }, false));
+        let direct_error = dec.decode(&next, 1).is_err();
+        dec.flush();
+        assert!(direct_error || dec.take_error().is_some());
+    }
+}
+
+#[test]
+fn depth_change_at_idr_replaces_sample_storage() {
+    for depths in [[8, 10, 9, 8], [10, 8, 10, 9]] {
+        let mut dec = Decoder::with_threads(1);
+        let mut pictures = Vec::new();
+        for (pts, depth) in depths.into_iter().enumerate() {
+            let mut stream = depth_sps(depth, depth, 1, false);
+            stream.extend(pps(false, false));
+            stream.extend(depth_pcm_slice(depth, false, true, 0));
+            pictures.extend(dec.decode(&stream, pts as i64).unwrap());
+        }
+        pictures.extend(dec.flush());
+        assert!(dec.take_error().is_none());
+        assert_eq!(pictures.len(), depths.len());
+        for (p, depth) in pictures.iter().zip(depths) {
+            assert_eq!(p.bit_depth, depth);
+            assert_eq!(p.y.as_u8().is_some(), depth == 8);
+        }
+    }
+}
+
+#[test]
+fn slice_qpy_range_at_nine_and_ten_bits() {
+    use crate::params::{Pps, Sps};
+    use crate::slice::{NalHeader, SliceHeader};
+    use filmcraft_bitstream::unescape_rbsp;
+    for depth in [8, 9, 10] {
+        let bytes = depth_sps(depth, depth, 1, false);
+        let sps = Sps::parse(&unescape_rbsp(&bytes[5..])).unwrap();
+        let pps_bytes = pps(false, false);
+        let sets = [Some(sps.clone())];
+        let pps = Pps::parse(&unescape_rbsp(&pps_bytes[5..]), &sets).unwrap();
+        let offset = 6 * (depth - 8) as i32;
+        for qp in [-offset - 1, -offset, 0, 51, 52, i32::MAX] {
+            let mut writer = BitWriter::new();
+            slice_header_qp(&mut writer, &Pic { idr: true, ref_idc: 3, ..Default::default() }, false, qp - 26);
+            writer.rbsp_trailing();
+            let header = NalHeader { nal_ref_idc: 3, nal_unit_type: 5 };
+            let bytes = writer.finish();
+            let result = SliceHeader::parse(&bytes, header, |_| Ok((&pps, &sps)));
+            assert_eq!(result.is_ok(), (-offset..=51).contains(&qp), "depth {depth}, QP {qp}");
+        }
+    }
+}
+
+#[test]
+fn ten_bit_weighted_p_and_b_skip_scale_offsets() {
+    for cabac in [false, true] {
+        for b in [false, true] {
+            let mut stream = depth_sps(10, 10, 1, false);
+            stream.extend(pps(cabac, true));
+            stream.extend(depth_pcm_slice(10, cabac, true, 0));
+            let weights = [[(32, 3), (8, -4), (8, 5)], [(16, -7), (4, 6), (4, -3)]];
+            stream.extend(slice_nal(&Pic {
+                frame_num: 1,
+                ref_idc: if b { 0 } else { 3 },
+                b,
+                mbs: vec![None; NMB],
+                wt: Some(weights),
+                ..Default::default()
+            }, cabac));
+            let mut dec = Decoder::with_threads(1);
+            let mut pics = dec.decode(&stream, 0).unwrap();
+            pics.extend(dec.flush());
+            assert!(dec.take_error().is_none());
+            assert_eq!(pics.len(), 2);
+            for (comp, (source, output)) in [(&pics[0].y, &pics[1].y), (&pics[0].u, &pics[1].u), (&pics[0].v, &pics[1].v)].into_iter().enumerate() {
+                let denom = if comp == 0 { 5 } else { 3 };
+                let (w0, o0) = weights[0][comp];
+                let (w1, o1) = weights[1][comp];
+                for (&input, &got) in source.as_u16().unwrap().iter().zip(output.as_u16().unwrap()) {
+                    let input = i32::from(input);
+                    let expected = if b {
+                        ((input * w0 + input * w1 + (1 << denom)) >> (denom + 1)) + ((o0 * 4 + o1 * 4 + 1) >> 1)
+                    } else {
+                        ((input * w0 + (1 << (denom - 1))) >> denom) + o0 * 4
+                    }.clamp(0, 1023) as u16;
+                    assert_eq!(got, expected, "cabac {cabac}, B {b}, component {comp}");
+                }
+            }
+        }
     }
 }

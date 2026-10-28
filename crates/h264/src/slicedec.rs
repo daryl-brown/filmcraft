@@ -254,6 +254,10 @@ fn median(a: i16, b: i16, c: i16) -> i16 {
 
 impl<'a, S: Sample> SliceDecoder<'a, S> {
     pub fn new(sh: &'a SliceHeader, pps: &'a Pps, sps: &'a Sps, pic: &'a mut PicState<S>, refs: &'a [Vec<RefPic>; 2], ls: &'a LevelScale) -> Result<Self> {
+        for reference in refs.iter().flatten() {
+            ensure!(reference.frame.bit_depth == sps.bit_depth_luma, "reference picture bit depth differs from slice");
+            ensure!(S::rows(&reference.frame).is_some(), "reference picture sample storage differs from slice");
+        }
         let slice_num = pic.slices.len() as u32;
         let chroma_qp_offset = [pps.chroma_qp_index_offset, pps.second_chroma_qp_index_offset];
         pic.slices.push(SliceInfo {
@@ -388,7 +392,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
     }
 
     fn chroma_qp(&self, qp: i32, c: usize) -> i32 {
-        QPC_TABLE[(qp + self.chroma_qp_offset[c]).clamp(0, 51) as usize] as i32
+        chroma_qp(qp, self.chroma_qp_offset[c], 6 * (self.sps.bit_depth_chroma - 8) as i32)
     }
 
     /// nC for a luma 4x4 block (raster index) - 9.2.1.
@@ -730,7 +734,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
                 let (w0, o0) = get(0);
                 let (w1, o1) = get(1);
                 let log_wd = if comp == 0 { w.luma_denom } else { w.chroma_denom };
-                Weight::Weighted { log_wd, w0, w1, o0, o1 }
+                Weight::Weighted { log_wd, w0, w1, o0: o0 << (self.bit_depth - 8), o1: o1 << (self.bit_depth - 8) }
             }
         }
     }
@@ -1040,7 +1044,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
     }
 
     /// Write I_PCM samples.
-    pub fn write_pcm(&mut self, samples: &[u8]) {
+    pub fn write_pcm(&mut self, samples: &[u16]) {
         let stride = self.pic.planes.width;
         let (x0, y0) = (self.mb_x * 16, self.mb_y * 16);
         for r in 0..16 {
@@ -1059,7 +1063,9 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
 
     /// Common state for an I_PCM MB.
     pub fn finish_pcm(&mut self) {
-        let qpc = [self.chroma_qp(0, 0) as u8, self.chroma_qp(0, 1) as u8];
+        // I_PCM has QPY = 0 for filtering. Keep self.qp as the previous non-PCM QPY
+        // for the following macroblock's quantiser derivation (8.5.1).
+        let qpc = [self.chroma_qp(0, 0) as i8, self.chroma_qp(0, 1) as i8];
         let st = self.mb_mut();
         st.kind = MbKind::IPcm;
         st.qp = 0;
@@ -1074,16 +1080,15 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
 
     /// Update QP after mb_qp_delta.
     pub fn apply_qp_delta(&mut self, delta: i32) -> Result<()> {
-        ensure!((-26..=25).contains(&delta), "mb_qp_delta {delta} out of range");
-        self.qp = (self.qp + delta + 52) % 52;
+        self.qp = wrap_qp(self.qp, delta, 6 * (self.bit_depth - 8) as i32)?;
         Ok(())
     }
 
     pub fn store_qp(&mut self) {
         let qp = self.qp;
-        let qpc = [self.chroma_qp(qp, 0) as u8, self.chroma_qp(qp, 1) as u8];
+        let qpc = [self.chroma_qp(qp, 0) as i8, self.chroma_qp(qp, 1) as i8];
         let st = self.mb_mut();
-        st.qp = qp as u8;
+        st.qp = qp as i8;
         st.qpc = qpc;
     }
 
@@ -1097,7 +1102,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
 
     /// Store a 4x4 luma block given in scan order (levels[0..16]); `ac_only` skips position 0.
     pub fn put_luma4(&mut self, raster: usize, levels: &[i32; 16], ac_only: bool) {
-        let qp = self.qp;
+        let qp = self.qp + 6 * (self.bit_depth - 8) as i32;
         let ls = &self.ls.ls4[self.luma_list4()][(qp % 6) as usize];
         let blk = &mut self.s.coef[raster * 16..raster * 16 + 16];
         let mut any = false;
@@ -1116,7 +1121,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
 
     /// Store an 8x8 luma block given in scan order.
     pub fn put_luma8(&mut self, b8: usize, levels: &[i32; 64]) {
-        let qp = self.qp;
+        let qp = self.qp + 6 * (self.bit_depth - 8) as i32;
         let list = if self.mb().kind.is_intra() { 0 } else { 1 };
         let ls = &self.ls.ls8[list][(qp % 6) as usize];
         let blk = &mut self.s.coef[b8 * 64..b8 * 64 + 64];
@@ -1142,7 +1147,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         for (k, &lv) in levels.iter().enumerate() {
             c[ZIGZAG4[k] as usize] = lv;
         }
-        let qp = self.qp;
+        let qp = self.qp + 6 * (self.bit_depth - 8) as i32;
         let ls00 = self.ls.ls4[0][(qp % 6) as usize][0];
         transform::luma_dc_dequant(&mut c, qp, ls00);
         for (r, &dc) in c.iter().enumerate() {
@@ -1156,7 +1161,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
     /// Chroma DC levels (4:2:0: 4 values in raster order) for component `c`.
     pub fn put_chroma_dc(&mut self, c: usize, levels: &[i32; 4]) {
         let mut v = *levels;
-        let qpc = self.chroma_qp(self.qp, c);
+        let qpc = self.chroma_qp(self.qp, c) + 6 * (self.sps.bit_depth_chroma - 8) as i32;
         let list = if self.mb().kind.is_intra() { 1 + c } else { 4 + c };
         let ls00 = self.ls.ls4[list][(qpc % 6) as usize][0];
         transform::chroma_dc_dequant_420(&mut v, qpc, ls00);
@@ -1170,7 +1175,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
 
     /// Chroma AC levels (scan positions 1..16 in levels[1..]) for block `b` of component `c`.
     pub fn put_chroma_ac(&mut self, c: usize, b: usize, levels: &[i32; 16]) {
-        let qpc = self.chroma_qp(self.qp, c);
+        let qpc = self.chroma_qp(self.qp, c) + 6 * (self.sps.bit_depth_chroma - 8) as i32;
         let list = if self.mb().kind.is_intra() { 1 + c } else { 4 + c };
         let ls = &self.ls.ls4[list][(qpc % 6) as usize];
         let blk = &mut self.s.coef_c[c][b * 16..b * 16 + 16];
@@ -1238,13 +1243,7 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
         self.cur = MbCur { info, ..Default::default() };
         if info.kind == MbKind::IPcm {
             r.byte_align();
-            let pos = r.byte_pos();
-            let data = r.data();
-            ensure!(data.len() >= pos + 384, "truncated I_PCM macroblock");
-            let Some(&samples) = data.get(pos..).and_then(|d| d.first_chunk::<384>()) else {
-                return invalid("truncated I_PCM macroblock");
-            };
-            r.skip(384 * 8)?;
+            let samples = read_pcm(r, self.bit_depth)?;
             self.finish_pcm();
             self.write_pcm(&samples);
             return Ok(());
@@ -1465,5 +1464,55 @@ impl<'a, S: Sample> SliceDecoder<'a, S> {
             }
         }
         Ok(())
+    }
+}
+
+/// Unprimed chroma QP (8.5.8, Table 8-15).
+fn chroma_qp(qpy: i32, offset: i32, bd_offset: i32) -> i32 {
+    let qpi = (qpy + offset).clamp(-bd_offset, 51);
+    if qpi < 30 { qpi } else { QPC_TABLE[qpi as usize] as i32 }
+}
+
+fn wrap_qp(qp: i32, delta: i32, bd_offset: i32) -> Result<i32> {
+    ensure!((-(26 + bd_offset / 2)..=25 + bd_offset / 2).contains(&delta), "mb_qp_delta {delta} out of range");
+    Ok((qp + delta + 52 + 2 * bd_offset) % (52 + bd_offset) - bd_offset)
+}
+
+pub(crate) fn read_pcm(r: &mut BitReader, bit_depth: u32) -> Result<[u16; 384]> {
+    let mut samples = [0u16; 384];
+    for sample in &mut samples {
+        *sample = r.read_bits(bit_depth)? as u16;
+    }
+    Ok(samples)
+}
+
+#[cfg(test)]
+mod depth_tests {
+    use super::*;
+
+    #[test]
+    fn chroma_qp_maps_negative_and_clipped_indices() {
+        assert_eq!(chroma_qp(-12, -6, 12), -12);
+        assert_eq!(chroma_qp(-5, 0, 12), -5);
+        assert_eq!(chroma_qp(-5, 6, 12), 1);
+        assert_eq!(chroma_qp(29, 0, 12), 29);
+        assert_eq!(chroma_qp(30, 0, 12), 29);
+        assert_eq!(chroma_qp(51, 6, 12), 39);
+        assert_eq!(chroma_qp(-6, -6, 6), -6);
+    }
+
+    #[test]
+    fn qp_wrap_includes_negative_qpy() {
+        for offset in [0, 6, 12] {
+            assert_eq!(wrap_qp(-offset, -1, offset).unwrap(), 51);
+            assert_eq!(wrap_qp(51, 1, offset).unwrap(), -offset);
+            for qp in -offset..=51 {
+                for delta in -(26 + offset / 2)..=25 + offset / 2 {
+                    assert_eq!(wrap_qp(qp, delta, offset).unwrap(), (qp + delta + offset).rem_euclid(52 + offset) - offset);
+                }
+            }
+            assert!(wrap_qp(0, -27 - offset / 2, offset).is_err());
+            assert!(wrap_qp(0, 26 + offset / 2, offset).is_err());
+        }
     }
 }

@@ -1,8 +1,9 @@
 //! Clean-room pure-Rust H.264 / AVC decoder, implemented from ITU-T Rec. H.264 (ISO/IEC 14496-10).
 //!
-//! Storage is bit-depth generic; supported streams remain 8-bit 4:2:0.
+//! Supports 8 to 10-bit 4:2:0 with native byte or word sample storage.
 //!
-//! Supported: progressive (frame) coding, 8-bit 4:2:0, Baseline / Main / High profiles — CAVLC and CABAC,
+//! Supported: progressive (frame) coding, 8 to 10-bit 4:2:0, Baseline / Main / High / High 10
+//! and High 4:2:2 profiles (4:2:0 only), CAVLC and CABAC,
 //! I/P/B slices, 8x8 transform, custom scaling matrices, weighted prediction, spatial/temporal direct,
 //! multiple slices, long-term references and all MMCOs, deblocking.
 //!

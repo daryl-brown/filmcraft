@@ -1,4 +1,4 @@
-//! Deblocking filter (8.7) for progressive frames, 4:2:0, 8-bit.
+//! Deblocking filter (8.7) for progressive frames, 4:2:0, 8 to 10-bit.
 
 use crate::picture::{MbKind, MbState, Planes, Sample};
 use crate::slicedec::{PicState, SliceInfo};
@@ -356,12 +356,13 @@ struct FilterOffsets {
 }
 
 /// Edge filter parameters for neighbouring QPs `qpp` / `qpq` (8.7.2.2).
-fn edge_params(qpp: i32, qpq: i32, b: [u8; 4], off: FilterOffsets) -> EdgeParams {
+fn edge_params(qpp: i32, qpq: i32, b: [u8; 4], off: FilterOffsets, bit_depth: u32) -> EdgeParams {
+    let scale = 1 << (bit_depth - 8);
     let qpav = (qpp + qpq + 1) >> 1;
     let index_a = (qpav + off.alpha).clamp(0, 51) as usize;
     let index_b = (qpav + off.beta).clamp(0, 51) as usize;
-    let tc = |b: u8| if (1..4).contains(&b) { TC0[index_a][b as usize - 1] as i32 } else { 0 };
-    EdgeParams { bs: b, tc0: [tc(b[0]), tc(b[1]), tc(b[2]), tc(b[3])], alpha: ALPHA[index_a] as i32, beta: BETA[index_b] as i32 }
+    let tc = |b: u8| if (1..4).contains(&b) { TC0[index_a][b as usize - 1] as i32 * scale } else { 0 };
+    EdgeParams { bs: b, tc0: [tc(b[0]), tc(b[1]), tc(b[2]), tc(b[3])], alpha: ALPHA[index_a] as i32 * scale, beta: BETA[index_b] as i32 * scale }
 }
 
 /// Everything the per-plane edge filters need to know about one macroblock.
@@ -370,10 +371,11 @@ struct MbEdges {
     offsets: FilterOffsets,
     mx: usize,
     my: usize,
+    bit_depth: u32,
     q_qp: i32,
-    q_qpc: [u8; 2],
+    q_qpc: [i8; 2],
     /// (luma QP, chroma QPs) of the left and top neighbours.
-    p_qp: [Option<(i32, [u8; 2])>; 2],
+    p_qp: [Option<(i32, [i8; 2])>; 2],
 }
 
 /// Filter the luma edges of one macroblock.
@@ -385,7 +387,7 @@ fn filter_luma_edges<S: Sample>(planes: &mut Planes<S>, m: &MbEdges, max_val: i3
                 continue;
             }
             let qpp = if e == 0 { m.p_qp[dir].map(|p| p.0).unwrap_or(m.q_qp) } else { m.q_qp };
-            let ep = edge_params(qpp, m.q_qp, m.bs[dir][e], m.offsets);
+            let ep = edge_params(qpp, m.q_qp, m.bs[dir][e], m.offsets, m.bit_depth);
             if ep.alpha == 0 || ep.beta == 0 {
                 // filterSamplesFlag needs |p0 - q0| < alpha and |p1 - p0| < beta (8.7.2.2): no
                 // sample of the edge changes (low QPs)
@@ -412,7 +414,7 @@ fn filter_chroma_edges<S: Sample>(planes: &mut Planes<S>, m: &MbEdges, max_val: 
                     continue;
                 }
                 let qpp = if e == 0 { m.p_qp[dir].map(|p| p.1[c]).unwrap_or(m.q_qpc[c]) } else { m.q_qpc[c] } as i32;
-                let ep = edge_params(qpp, m.q_qpc[c] as i32, m.bs[dir][e], m.offsets);
+                let ep = edge_params(qpp, m.q_qpc[c] as i32, m.bs[dir][e], m.offsets, m.bit_depth);
                 if ep.alpha == 0 || ep.beta == 0 {
                     continue;
                 }
@@ -456,6 +458,7 @@ pub fn deblock_mb<S: Sample>(pic: &mut PicState<S>, addr: usize, mb_w: usize) {
         offsets: FilterOffsets { alpha: sq.alpha_offset, beta: sq.beta_offset },
         mx,
         my,
+        bit_depth: pic.frame.bit_depth,
         q_qp: qp_of(q),
         q_qpc: q.qpc,
         p_qp: [neighbor_qp(left), neighbor_qp(top)],
@@ -468,8 +471,19 @@ pub fn deblock_mb<S: Sample>(pic: &mut PicState<S>, addr: usize, mb_w: usize) {
 mod tests {
     use super::*;
 
-    /// The vectorised edge filter equals the per-line reference [`filter8`] on random edges
-    /// (small differences across the edge so that every filter branch is taken).
+    #[test]
+    fn thresholds_scale_at_ten_bits() {
+        let off = FilterOffsets { alpha: -4, beta: 4 };
+        for qp in -12..=51 {
+            let a = edge_params(qp, qp, [1, 2, 3, 4], off, 8);
+            let b = edge_params(qp, qp, [1, 2, 3, 4], off, 10);
+            assert_eq!(b.alpha, a.alpha * 4);
+            assert_eq!(b.beta, a.beta * 4);
+            assert_eq!(b.tc0, a.tc0.map(|v| v * 4));
+        }
+    }
+
+    /// The vectorised edge filter equals the per-line reference on random edges.
     #[test]
     fn lane_filter_matches_per_line_reference() {
         let mut rng = 0x9e37_79b9_7f4a_7c15u64;
