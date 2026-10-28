@@ -17,9 +17,17 @@ function Invoke-Logged {
 
   & $Command 2>&1 | ForEach-Object { "$_" } | Tee-Object -FilePath $log
   $code = $LASTEXITCODE
-  if ($code -eq 0) { return }
-
   $lines = @(Get-Content -LiteralPath $log)
+  if ($code -eq 0) {
+    # Proof of work on success: the cargo test result lines, as one notice annotation.
+    $results = @($lines | Where-Object { $_ -match '^test result:' })
+    if ($results.Count -gt 0) {
+      $msg = ($results -join "`n").Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+      Write-Output "::notice title=$Title passed::$msg"
+    }
+    return
+  }
+
   $pattern = '^\s*error(\[|:)|^error: |panicked|FAILED|^failures:|^---- |mismatch|assertion'
   $keep = New-Object 'System.Collections.Generic.SortedSet[int]'
   for ($i = 0; $i -lt $lines.Count; $i++) {
