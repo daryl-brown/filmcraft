@@ -65,6 +65,12 @@ jobs:
           "version=$v" >> $env:GITHUB_OUTPUT
           Write-Output "version $v"
 
+      - name: Test FCP7 XML importer (debug, locked, no whisper)
+        shell: pwsh
+        run: |
+          cargo test --locked -p filmcraft-interchange --test it fcp7 --target $env:TARGET
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed with exit code $LASTEXITCODE" }
+
       - name: Build (release, locked, whisper enabled)
         shell: pwsh
         env:
