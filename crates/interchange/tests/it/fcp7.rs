@@ -5,7 +5,7 @@ use crate::support;
 
 use filmcraft_interchange::{ExportOptions, Format, Imported, detect, export, import};
 use filmcraft_media::Generator;
-use filmcraft_project::{ItemKind, Keyframe, Label, Marker, MarkerId, MarkerKind, MediaRef, Param, ParamValue, Project, TrackKind, TransitionAlign};
+use filmcraft_project::{ItemKind, Keyframe, Label, Marker, MarkerId, MarkerKind, MediaRef, Param, ParamValue, Project, Sequence, TrackKind, TransitionAlign};
 use filmcraft_time::{FrameRate, Tick};
 use proptest::prelude::*;
 use support::*;
@@ -197,6 +197,12 @@ fn golden_premiere_style_nested_and_transitions() {
     assert_eq!(s.settings.frame_rate, r);
     assert_eq!(s.start_timecode, 86_400);
 
+    assert_master_clip(p, r);
+    assert_main_video_and_effects(p, s, r, &rep);
+    assert_nested_and_audio(p, s, r, nest);
+}
+
+fn assert_master_clip(p: &Project, r: FrameRate) {
     // Master clip in the Footage bin, with its file characteristics.
     let tower = p.items.values().find(|i| i.name == "tower.mov").unwrap();
     let tm = tower.as_media().unwrap();
@@ -208,7 +214,9 @@ fn golden_premiere_style_nested_and_transitions() {
     let bin = p.root.children.iter().find_map(|c| if let filmcraft_project::BinEntry::Bin(b) = c { Some(b) } else { None }).unwrap();
     assert_eq!(bin.name, "Footage");
     assert_eq!(p.root.parent_of(tower.id), Some(bin.id));
+}
 
+fn assert_main_video_and_effects(p: &Project, s: &Sequence, r: FrameRate, rep: &filmcraft_interchange::Report) {
     // V1: -1 start/end resolved from in/out, centred dissolve.
     let v1 = &s.video_tracks[0];
     assert_eq!(v1.items.len(), 2);
@@ -233,7 +241,9 @@ fn golden_premiere_style_nested_and_transitions() {
     assert!(rep.mentions("Mystery Glow Pro"), "{rep}");
     assert_eq!(c2.markers.len(), 1);
     assert_eq!((c2.markers[0].name.as_str(), c2.markers[0].start), ("wave peak", r.tick_of(130)));
+}
 
+fn assert_nested_and_audio(p: &Project, s: &Sequence, r: FrameRate, nest: filmcraft_project::ItemId) {
     // V2: nested sequence clip, colour matte generator, locked track.
     let v2 = &s.video_tracks[1];
     assert!(v2.locked);
@@ -243,7 +253,7 @@ fn golden_premiere_style_nested_and_transitions() {
     assert_eq!(g.media, MediaRef::Generator(Generator::ColorMatte { color: [1.0, 0.0, 0.0, 1.0] }));
     let ns = p.sequence(nest).unwrap();
     assert_eq!(ns.video_tracks[0].items[0].speed, 2.0);
-    assert_eq!(ns.video_tracks[0].items[0].item, c2.item, "file-2 reference shared across sequences");
+    assert_eq!(ns.video_tracks[0].items[0].item, s.video_tracks[0].items[1].item, "file-2 reference shared across sequences");
 
     // Audio: levels as dB with keyframes, link to the video clip, disabled music.
     let a1 = &s.audio_tracks[0].items[0];
@@ -251,7 +261,7 @@ fn golden_premiere_style_nested_and_transitions() {
     assert!((lvl.keyframes[1].value.as_f64().unwrap() + 6.0206).abs() < 1e-3);
     assert_eq!(lvl.keyframes[0].value, ParamValue::Float(0.0));
     assert!(a1.link.is_some());
-    assert_eq!(a1.link, c1.link);
+    assert_eq!(a1.link, s.video_tracks[0].items[0].link);
     let music = &s.audio_tracks[1].items[0];
     assert!(!music.enabled);
     assert!(p.item(music.item).unwrap().as_media().unwrap().info.video.is_none());
@@ -298,18 +308,18 @@ fn rich_project() -> (Project, filmcraft_project::ItemId) {
     let b = media(&mut p, "/m/b.mov", true, true, r);
     let m = media(&mut p, "/m/music.wav", false, true, r);
     let nest = sequence(&mut p, "Nested", r, true);
-    clip(&mut p, nest, TrackKind::Video, 0, b, 0, 90, 30);
+    clip(&mut p, nest, TrackKind::Video, 0, b, 0..90, 30);
     let s = sequence(&mut p, "Main", r, true);
     p.sequence_mut(s).unwrap().start_timecode = 107_892;
-    let v1 = clip(&mut p, s, TrackKind::Video, 0, a, 0, 60, 10);
-    let a1 = clip(&mut p, s, TrackKind::Audio, 0, a, 0, 60, 10);
+    let v1 = clip(&mut p, s, TrackKind::Video, 0, a, 0..60, 10);
+    let a1 = clip(&mut p, s, TrackKind::Audio, 0, a, 0..60, 10);
     link(&mut p, s, &[v1, a1]);
-    let v2 = clip(&mut p, s, TrackKind::Video, 0, b, 60, 45, 300);
-    transition(&mut p, s, TrackKind::Video, 0, "dip_to_black", Some(v1), Some(v2), 50, 20, TransitionAlign::CenterAtCut);
-    transition(&mut p, s, TrackKind::Video, 0, "cross_dissolve", Some(v2), None, 90, 15, TransitionAlign::EndAtCut);
-    let n = clip(&mut p, s, TrackKind::Video, 1, nest, 20, 40, 0);
-    let mm = clip(&mut p, s, TrackKind::Audio, 1, m, 0, 105, 0);
-    transition(&mut p, s, TrackKind::Audio, 1, "constant_power", None, Some(mm), 0, 10, TransitionAlign::StartAtCut);
+    let v2 = clip(&mut p, s, TrackKind::Video, 0, b, 60..60 + (45), 300);
+    transition(&mut p, s, (TrackKind::Video, 0), "dip_to_black", (Some(v1), Some(v2)), 50..50 + (20), TransitionAlign::CenterAtCut);
+    transition(&mut p, s, (TrackKind::Video, 0), "cross_dissolve", (Some(v2), None), 90..90 + (15), TransitionAlign::EndAtCut);
+    let n = clip(&mut p, s, TrackKind::Video, 1, nest, 20..20 + (40), 0);
+    let mm = clip(&mut p, s, TrackKind::Audio, 1, m, 0..105, 0);
+    transition(&mut p, s, (TrackKind::Audio, 1), "constant_power", (None, Some(mm)), 0..10, TransitionAlign::StartAtCut);
     {
         let q = p.sequence_mut(s).unwrap();
         let (_, it) = q.find_item_mut(v2).unwrap();
@@ -398,8 +408,8 @@ fn version_5_and_generators() {
     let (mut p, s) = rich_project();
     let g = generator(&mut p, "Bars", Generator::BarsAndTone);
     let k = generator(&mut p, "Black", Generator::BlackVideo);
-    clip(&mut p, s, TrackKind::Video, 2, g, 0, 30, 0);
-    clip(&mut p, s, TrackKind::Video, 2, k, 30, 30, 0);
+    clip(&mut p, s, TrackKind::Video, 2, g, 0..30, 0);
+    clip(&mut p, s, TrackKind::Video, 2, k, 30..30 + (30), 0);
     let o = ExportOptions { xmeml_version: 5, ..Default::default() };
     let (imp, text, _) = roundtrip(&p, s, Format::Fcp7Xml, &o);
     assert!(text.contains("<xmeml version=\"5\">"));
@@ -445,7 +455,7 @@ proptest! {
         let mut aends = [0i64; 3];
         for g in &clips {
             let t = ends[g.track] + g.gap;
-            let v = clip(&mut p, s, TrackKind::Video, g.track, ms[g.media], t, g.dur, g.src);
+            let v = clip(&mut p, s, TrackKind::Video, g.track, ms[g.media], t..t + (g.dur), g.src);
             {
                 let q = p.sequence_mut(s).unwrap();
                 let (_, it) = q.find_item_mut(v).unwrap();
@@ -460,14 +470,14 @@ proptest! {
             let d = g.tr_len;
             let adjacent = g.gap == 0 && prev[g.track].is_some();
             match g.tr {
-                0 if adjacent => transition(&mut p, s, TrackKind::Video, g.track, "cross_dissolve", prev[g.track], Some(v), t - d / 2, d, TransitionAlign::CenterAtCut),
-                1 if adjacent => transition(&mut p, s, TrackKind::Video, g.track, "dip_to_white", prev[g.track], Some(v), t, d, TransitionAlign::StartAtCut),
-                2 if adjacent => transition(&mut p, s, TrackKind::Video, g.track, "push", prev[g.track], Some(v), t - d, d, TransitionAlign::EndAtCut),
-                3 if !adjacent => transition(&mut p, s, TrackKind::Video, g.track, "cross_dissolve", None, Some(v), t, d, TransitionAlign::StartAtCut),
+                0 if adjacent => transition(&mut p, s, (TrackKind::Video, g.track), "cross_dissolve", (prev[g.track], Some(v)), t - d / 2..t - d / 2 + (d), TransitionAlign::CenterAtCut),
+                1 if adjacent => transition(&mut p, s, (TrackKind::Video, g.track), "dip_to_white", (prev[g.track], Some(v)), t..t + (d), TransitionAlign::StartAtCut),
+                2 if adjacent => transition(&mut p, s, (TrackKind::Video, g.track), "push", (prev[g.track], Some(v)), t - d..t - d + (d), TransitionAlign::EndAtCut),
+                3 if !adjacent => transition(&mut p, s, (TrackKind::Video, g.track), "cross_dissolve", (None, Some(v)), t..t + (d), TransitionAlign::StartAtCut),
                 _ => {}
             }
             if g.audio && aends[g.track] <= t {
-                let a = clip(&mut p, s, TrackKind::Audio, g.track, ms[g.media], t, g.dur, g.src);
+                let a = clip(&mut p, s, TrackKind::Audio, g.track, ms[g.media], t..t + (g.dur), g.src);
                 link(&mut p, s, &[v, a]);
                 aends[g.track] = t + g.dur;
             }
@@ -536,7 +546,7 @@ fn sub_frame_clips_keep_equal_source_and_record_spans() {
     let mut p = Project::new("P");
     let a = media(&mut p, "/m/a.mov", true, true, r);
     let s = sequence(&mut p, "t", r, false);
-    let c = clip(&mut p, s, TrackKind::Video, 0, a, 0, 24, 0);
+    let c = clip(&mut p, s, TrackKind::Video, 0, a, 0..24, 0);
     // the issue's case first (start 0, source in 20 s, 3 s long), then starts, ins and lengths in tenths of a second
     let mut cases = vec![(0, 200, 30)];
     for start in [0, 1, 5, 17, 33] {
@@ -568,8 +578,8 @@ fn split_mono_tracks_keep_their_source_channel() {
     let mut p = Project::new("P");
     let a = media(&mut p, "/m/a.wav", false, true, r);
     let s = sequence(&mut p, "t", r, false);
-    let left = clip(&mut p, s, TrackKind::Audio, 0, a, 0, 24, 0);
-    let right = clip(&mut p, s, TrackKind::Audio, 1, a, 0, 24, 0);
+    let left = clip(&mut p, s, TrackKind::Audio, 0, a, 0..24, 0);
+    let right = clip(&mut p, s, TrackKind::Audio, 1, a, 0..24, 0);
     for (id, ch) in [(left, 0u16), (right, 1u16)] {
         let (_, it) = p.sequence_mut(s).unwrap().find_item_mut(id).unwrap();
         it.source_channels = vec![ch];
@@ -686,8 +696,8 @@ fn centred_mono_breakout_round_trips_centred() {
     let mut p = Project::new("P");
     let a = media(&mut p, "/m/a.wav", false, true, r);
     let s = sequence(&mut p, "t", r, false);
-    let left = clip(&mut p, s, TrackKind::Audio, 0, a, 0, 24, 0);
-    let right = clip(&mut p, s, TrackKind::Audio, 1, a, 0, 24, 0);
+    let left = clip(&mut p, s, TrackKind::Audio, 0, a, 0..24, 0);
+    let right = clip(&mut p, s, TrackKind::Audio, 1, a, 0..24, 0);
     for (id, ch) in [(left, 0u16), (right, 1u16)] {
         let (_, it) = p.sequence_mut(s).unwrap().find_item_mut(id).unwrap();
         it.source_channels = vec![ch];
@@ -723,9 +733,9 @@ fn fcp7_export_transition_bounded_audio() {
     let mut p = Project::new("P");
     let a = media(&mut p, "/audio/music.wav", false, true, r);
     let s = sequence(&mut p, "Faded audio", r, false);
-    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698, 179, 5378);
-    transition(&mut p, s, TrackKind::Audio, 0, "constant_power", None, Some(c), 698, 62, TransitionAlign::StartAtCut);
-    transition(&mut p, s, TrackKind::Audio, 0, "constant_power", Some(c), None, 820, 57, TransitionAlign::EndAtCut);
+    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698..698+179, 5378);
+    transition(&mut p, s, (TrackKind::Audio, 0), "constant_power", (None, Some(c)), 698..698+62, TransitionAlign::StartAtCut);
+    transition(&mut p, s, (TrackKind::Audio, 0), "constant_power", (Some(c), None), 820..820+57, TransitionAlign::EndAtCut);
     let (bytes, _) = export(&p, s, Format::Fcp7Xml, &ExportOptions::default()).unwrap();
     let xml = String::from_utf8(bytes).unwrap();
     assert_eq!(clip_spans(&xml), vec![(-1, -1, 5378, 5557)], "{xml}");
@@ -758,7 +768,7 @@ fn fcp7_export_unbounded_audio_keeps_numeric_bounds() {
     let mut p = Project::new("P");
     let a = media(&mut p, "/audio/music.wav", false, true, r);
     let s = sequence(&mut p, "S", r, false);
-    clip(&mut p, s, TrackKind::Audio, 0, a, 698, 179, 5378);
+    clip(&mut p, s, TrackKind::Audio, 0, a, 698..698+179, 5378);
     let (_, xml, _) = roundtrip(&p, s, Format::Fcp7Xml, &ExportOptions::default());
     assert_eq!(clip_spans(&xml), vec![(698, 877, 5378, 5557)], "{xml}");
 }
@@ -770,8 +780,8 @@ fn fcp7_export_start_fade_keeps_numeric_bounds() {
     let mut p = Project::new("P");
     let a = media(&mut p, "/audio/music.wav", false, true, r);
     let s = sequence(&mut p, "S", r, false);
-    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698, 179, 5378);
-    transition(&mut p, s, TrackKind::Audio, 0, "constant_power", None, Some(c), 698, 62, TransitionAlign::StartAtCut);
+    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698..698+179, 5378);
+    transition(&mut p, s, (TrackKind::Audio, 0), "constant_power", (None, Some(c)), 698..698+62, TransitionAlign::StartAtCut);
     let (_, xml, _) = roundtrip(&p, s, Format::Fcp7Xml, &ExportOptions::default());
     assert_eq!(clip_spans(&xml), vec![(698, 877, 5378, 5557)], "{xml}");
 }
@@ -785,12 +795,12 @@ fn fcp7_export_audio_constant_power_uses_premiere_id() {
     let a = media(&mut p, "/audio/music.wav", false, true, r);
     let v = media(&mut p, "/video/shot.mov", true, false, r);
     let s = sequence(&mut p, "S", r, false);
-    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698, 179, 5378);
-    transition(&mut p, s, TrackKind::Audio, 0, "constant_power", None, Some(c), 698, 62, TransitionAlign::StartAtCut);
-    let g = clip(&mut p, s, TrackKind::Audio, 1, a, 100, 100, 0);
-    transition(&mut p, s, TrackKind::Audio, 1, "constant_gain", None, Some(g), 100, 20, TransitionAlign::StartAtCut);
-    let vc = clip(&mut p, s, TrackKind::Video, 0, v, 0, 100, 0);
-    transition(&mut p, s, TrackKind::Video, 0, "cross_dissolve", None, Some(vc), 0, 20, TransitionAlign::StartAtCut);
+    let c = clip(&mut p, s, TrackKind::Audio, 0, a, 698..698+179, 5378);
+    transition(&mut p, s, (TrackKind::Audio, 0), "constant_power", (None, Some(c)), 698..698+62, TransitionAlign::StartAtCut);
+    let g = clip(&mut p, s, TrackKind::Audio, 1, a, 100..100+100, 0);
+    transition(&mut p, s, (TrackKind::Audio, 1), "constant_gain", (None, Some(g)), 100..100+20, TransitionAlign::StartAtCut);
+    let vc = clip(&mut p, s, TrackKind::Video, 0, v, 0..0+100, 0);
+    transition(&mut p, s, (TrackKind::Video, 0), "cross_dissolve", (None, Some(vc)), 0..0+20, TransitionAlign::StartAtCut);
     let (bytes, _) = export(&p, s, Format::Fcp7Xml, &ExportOptions::default()).unwrap();
     let xml = String::from_utf8(bytes).unwrap();
     assert!(xml.contains("<name>Cross Fade (+3dB)</name>"), "{xml}");
