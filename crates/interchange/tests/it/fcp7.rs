@@ -871,7 +871,7 @@ fn premiere_gain_round_trip() {
         let (bytes, _) = export(&imp.project, only_seq(&imp), Format::Fcp7Xml, &ExportOptions::default()).unwrap();
         let xml = std::str::from_utf8(&bytes).unwrap();
         assert!(!xml.contains("<name>Gain</name>"));
-        let parsed = roxmltree::Document::parse(xml).unwrap();
+        let parsed = roxmltree::Document::parse_with_options(xml, roxmltree::ParsingOptions { allow_dtd: true, ..Default::default() }).unwrap();
         let amplitude: f64 = parsed.descendants().find(|n| n.has_tag_name("parameter") && n.children().any(|c| c.has_tag_name("parameterid") && c.text() == Some("level")))
             .unwrap().children().find(|n| n.has_tag_name("value")).unwrap().text().unwrap().parse().unwrap();
         assert!((amplitude - 10.0_f64.powf(2.0 / 20.0)).abs() < 1e-6);
