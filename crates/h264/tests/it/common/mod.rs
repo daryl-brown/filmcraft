@@ -464,8 +464,11 @@ pub fn compare(pics: &[Picture], reference: &[u8], w: usize, h: usize) -> Result
             return Err(format!("frame {i}: size {}x{} != {}x{}", p.width, p.height, w, h));
         }
         let f = &reference[i * fsize..(i + 1) * fsize];
-        let planes =
-            [("Y", &p.y[..], &f[..w * h], w, h, 16), ("U", &p.u[..], &f[w * h..w * h + cw * ch], cw, ch, 8), ("V", &p.v[..], &f[w * h + cw * ch..], cw, ch, 8)];
+        let planes = [
+            ("Y", p.y.as_u8().unwrap(), &f[..w * h], w, h, 16),
+            ("U", p.u.as_u8().unwrap(), &f[w * h..w * h + cw * ch], cw, ch, 8),
+            ("V", p.v.as_u8().unwrap(), &f[w * h + cw * ch..], cw, ch, 8),
+        ];
         for (name, got, exp, pw, ph, mbs) in planes {
             if got != exp {
                 let mut first = None;

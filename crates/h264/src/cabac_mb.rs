@@ -4,7 +4,7 @@
 use crate::cabac::Cabac;
 use crate::error::{Result, ensure, invalid};
 use crate::mbtypes::{MbTypeInfo, Part, SubMbInfo, b_mb_type, b_sub_mb_type, intra_mb_type, p_mb_type, p_sub_mb_type};
-use crate::picture::MbKind;
+use crate::picture::{MbKind, Sample};
 use crate::slice::SliceType;
 use crate::slicedec::{MbCur, SliceDecoder};
 
@@ -37,7 +37,7 @@ const CHROMA_DC_CTX: [u8; 4] = [0, 1, 2, 2];
 /// Table 9-40 ctxIdxBlockCatOffset for ctxBlockCat 0..=5: (coded_block_flag, significant/last, abs level).
 const CAT_OFFSET: [(usize, usize, usize); 6] = [(0, 0, 0), (4, 15, 10), (8, 29, 20), (12, 44, 30), (16, 47, 39), (0, 0, 0)];
 
-impl SliceDecoder<'_> {
+impl<S: Sample> SliceDecoder<'_, S> {
     /// Decode slice_data() with CABAC. `rbsp` is the whole slice RBSP.
     pub fn decode_cabac(&mut self, rbsp: &[u8]) -> Result<()> {
         let start = self.sh.header_bits.div_ceil(8) * 8;

@@ -31,8 +31,9 @@ oracles and fixture generators.
   the level (or VUI `max_dec_frame_buffering`) and `max_num_reorder_frames`.
 - Deblocking filter: full bS derivation, `disable_deblocking_filter_idc` 0/1/2, slice offsets,
   8x8-transform edges.
-- Output: cropped 8-bit planar 4:2:0 pictures in output order with the caller's `pts`, POC, key
-  flag, VUI colour description (range, primaries, transfer, matrix) and sample aspect ratio.
+- Output: cropped planar 4:2:0 pictures with bit-depth-generic storage (supported streams remain
+  8-bit), in output order with the caller's `pts`, POC, key flag, VUI colour description (range,
+  primaries, transfer, matrix) and sample aspect ratio.
 - Frame-level multithreading (see below).
 - Draft mode for reduced-resolution playback (off by default): non-reference pictures skip the
   deblocking filter and are flagged `Picture::draft`; every other picture stays bit-exact.
@@ -46,7 +47,8 @@ let mut dec = Decoder::new(); // or Decoder::with_threads(n), Decoder::from_avcc
 // dec.threads(): worker threads in use; dec.set_draft(true): draft mode (playback only)
 for (pts, access_unit) in access_units {
     for pic in dec.decode(access_unit, pts)? {
-        // pic.width / pic.height (cropped), pic.y / pic.u / pic.v, pic.y_stride / pic.uv_stride,
+        // pic.width / pic.height (cropped), pic.bit_depth, pic.y / pic.u / pic.v (Plane),
+        // pic.y_stride / pic.uv_stride,
         // pic.pts, pic.poc, pic.key, pic.color, pic.sar
     }
 }
@@ -213,11 +215,12 @@ file; `H264_BENCH_ITERS=n` (and `H264_THREADS=t`, `H264_DRAFT=1`) turns it into 
 
 ### Extending to High 10 and 4:2:2
 
-The chroma format and bit depth are isolated behind `Sps::check_supported`. The parts that are
-format-specific today: `Planes`/`FrameRow` sample type (`u8`; a `u16` variant or a generic sample
-type is needed for bit depths > 8, together with `Clip1` ranges, `QpBdOffset` in the QP
-derivations and the scaled tC0/alpha/beta in deblocking), chroma block geometry (`MbWidthC` /
-`MbHeightC` = 8x8 in `slicedec`, `intra::pred_chroma`, the chroma DC transform and the CABAC/CAVLC
-chroma DC parsing — the 2x4 total_zeros tables and ctxBlockCat 3 `NumC8x8` handling are already in
-place), chroma motion-vector vertical scaling and the chroma deblocking edges (4:2:2 has four
-horizontal chroma edges).
+The chroma format and bit depth are isolated behind `Sps::check_supported`. `Planes` and
+`FrameRow` use a generic sample type, with `u8` storage for 8-bit pictures and `u16` storage for
+higher bit depths. Stream support remains 8-bit 4:2:0. Higher bit depth semantics still need
+`QpBdOffset` in the QP derivations and scaled tC0/alpha/beta in deblocking. The remaining
+format-specific parts are chroma block geometry (`MbWidthC` / `MbHeightC` = 8x8 in `slicedec`,
+`intra::pred_chroma`, the chroma DC transform and the CABAC/CAVLC chroma DC parsing; the 2x4
+total_zeros tables and ctxBlockCat 3 `NumC8x8` handling are already in place), chroma
+motion-vector vertical scaling and the chroma deblocking edges (4:2:2 has four horizontal
+chroma edges).

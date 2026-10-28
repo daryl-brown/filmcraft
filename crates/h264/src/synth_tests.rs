@@ -427,7 +427,10 @@ fn build_and_check(cabac: bool, threads: usize) {
     assert_eq!(out.len(), expected.len(), "cabac={cabac}");
     for (i, (p, e)) in out.iter().zip(expected.iter()).enumerate() {
         assert_eq!((p.width as usize, p.height as usize), (MB_W * 16, MB_H * 16));
-        assert!(p.y == e.0 && p.u == e.1 && p.v == e.2, "picture {i} differs (cabac={cabac}, threads={threads})");
+        assert!(
+            p.y.as_u8().unwrap() == e.0.as_slice() && p.u.as_u8().unwrap() == e.1.as_slice() && p.v.as_u8().unwrap() == e.2.as_slice(),
+            "picture {i} differs (cabac={cabac}, threads={threads})"
+        );
     }
     let s = dec.stats();
     assert!(s.mb_pcm > 0 && s.frame_num_gaps == 1 && s.long_term_marks >= 3, "{s:?}");
@@ -515,7 +518,10 @@ fn weighted_check(cabac: bool, threads: usize) {
     assert!(dec.take_error().is_none());
     assert_eq!(out.len(), 4);
     for (i, (p, e)) in out.iter().zip(expected.iter()).enumerate() {
-        assert!(p.y == e.0 && p.u == e.1 && p.v == e.2, "picture {i} differs (cabac={cabac}, threads={threads})");
+        assert!(
+            p.y.as_u8().unwrap() == e.0.as_slice() && p.u.as_u8().unwrap() == e.1.as_slice() && p.v.as_u8().unwrap() == e.2.as_slice(),
+            "picture {i} differs (cabac={cabac}, threads={threads})"
+        );
     }
 }
 
@@ -551,8 +557,83 @@ fn poc_type1_reordering() {
             for (k, p) in out.iter().enumerate() {
                 let e = render(&contents[expected_order[k]], None);
                 assert_eq!(p.poc, expected_poc[k]);
-                assert!(p.y == e.0 && p.u == e.1 && p.v == e.2, "output {k} (cabac={cabac})");
+                assert!(
+                    p.y.as_u8().unwrap() == e.0.as_slice() && p.u.as_u8().unwrap() == e.1.as_slice() && p.v.as_u8().unwrap() == e.2.as_slice(),
+                    "output {k} (cabac={cabac})"
+                );
             }
         }
+    }
+}
+
+#[test]
+fn sample_storage_intra_dc_matches() {
+    use crate::intra::{self, Avail};
+
+    let input: Vec<u8> = (0..32 * 32).map(|i| ((i * 17 + i / 32 * 3) & 255) as u8).collect();
+    for top in [false, true] {
+        for left in [false, true] {
+            let a = Avail { top, left, top_left: top && left, top_right: top };
+            for size in [4, 8, 16] {
+                let mut narrow = input.clone();
+                let mut wide: Vec<u16> = input.iter().copied().map(u16::from).collect();
+                match size {
+                    4 => {
+                        intra::pred4x4(&mut narrow, 32, 8, 8, 2, a, 8);
+                        intra::pred4x4(&mut wide, 32, 8, 8, 2, a, 8);
+                    }
+                    8 => {
+                        intra::pred8x8(&mut narrow, 32, 8, 8, 2, a, 8);
+                        intra::pred8x8(&mut wide, 32, 8, 8, 2, a, 8);
+                    }
+                    _ => {
+                        intra::pred16x16(&mut narrow, 32, 8, 8, 2, a, 8);
+                        intra::pred16x16(&mut wide, 32, 8, 8, 2, a, 8);
+                    }
+                }
+                assert_eq!(narrow.iter().copied().map(u16::from).collect::<Vec<_>>(), wide, "DC size {size}, top {top}, left {left}");
+            }
+            let mut narrow = input.clone();
+            let mut wide: Vec<u16> = input.iter().copied().map(u16::from).collect();
+            intra::pred_chroma(&mut narrow, 32, 8, 8, 0, a, 8);
+            intra::pred_chroma(&mut wide, 32, 8, 8, 0, a, 8);
+            assert_eq!(narrow.iter().copied().map(u16::from).collect::<Vec<_>>(), wide);
+        }
+    }
+}
+
+#[test]
+fn sample_storage_deblock_matches() {
+    use crate::picture::{Frame, MbKind, Planes, Sample};
+    use crate::slicedec::{PicState, SliceInfo};
+    use std::sync::Arc;
+
+    fn filtered<S: Sample>() -> Planes<S> {
+        // Only private reconstruction planes are used here; rows are never published.
+        let mut pic = PicState::<S>::new(Arc::new(Frame::new(1, 0, 2, 2, 8)));
+        pic.slices.push(SliceInfo::default());
+        for mb in &mut pic.mbs {
+            mb.kind = MbKind::I16x16;
+            mb.slice_num = 0;
+            mb.qp = 40;
+            mb.qpc = [40; 2];
+        }
+        for (plane, stride) in [(&mut pic.planes.y, 32), (&mut pic.planes.cb, 16), (&mut pic.planes.cr, 16)] {
+            for (i, sample) in plane.iter_mut().enumerate() {
+                *sample = S::from_i32(96 + (i % stride / 4 * 2 + i / stride / 4) as i32);
+            }
+        }
+        let before = pic.planes.y.clone();
+        for addr in 0..4 {
+            crate::deblock::deblock_mb(&mut pic, addr, 2);
+        }
+        assert_ne!(before, pic.planes.y, "deblock must change the input");
+        pic.planes
+    }
+
+    let narrow = filtered::<u8>();
+    let wide = filtered::<u16>();
+    for (a, b) in [(&narrow.y, &wide.y), (&narrow.cb, &wide.cb), (&narrow.cr, &wide.cr)] {
+        assert_eq!(a.iter().copied().map(u16::from).collect::<Vec<_>>(), *b);
     }
 }

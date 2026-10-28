@@ -78,7 +78,7 @@ fn draft_mode_changes_only_flagged_non_reference_pictures() {
             let (mut draft, mut changed) = (0, 0);
             for (i, p) in pics.iter().enumerate() {
                 let r = &reference[i * fsize..(i + 1) * fsize];
-                let same = p.y == r[..w * h] && [&p.u[..], &p.v[..]].concat() == r[w * h..];
+                let same = p.y.as_u8().unwrap() == &r[..w * h] && [p.u.as_u8().unwrap(), p.v.as_u8().unwrap()].concat() == r[w * h..];
                 if p.draft {
                     draft += 1;
                     changed += !same as usize;
