@@ -129,6 +129,17 @@ mod tests {
     }
 
     #[test]
+    fn bench_render_and_scale_options() {
+        let a = args("bench-decode clip.mov --scale 0.5 --render");
+        assert_eq!(a.positionals, ["bench-decode", "clip.mov"]);
+        assert_eq!(a.opt("--scale"), Some("0.5"));
+        assert!(a.flag("--render"));
+        let missing = args("bench-decode clip.mov --render --scale");
+        assert!(missing.flag("--scale"));
+        assert_eq!(missing.opt("--scale"), None);
+    }
+
+    #[test]
     fn options_anywhere_and_positionals() {
         let a = args("exec --demo timeline.razor seconds=3.5 --project p.fcproj --save --compact");
         assert_eq!(a.positionals, ["exec", "timeline.razor", "seconds=3.5"]);

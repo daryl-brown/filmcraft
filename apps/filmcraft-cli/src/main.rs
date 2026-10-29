@@ -96,8 +96,9 @@ SUBCOMMANDS
   probe <media> [--image-sequence]
                                 media info as JSON, with MXF / Ogg / BWF details; with
                                 --image-sequence <media> is the first numbered still of a sequence
-  bench-decode <media> [--frames N] [--start F] [--workers N]
+  bench-decode <media> [--frames N] [--start F] [--workers N] [--render] [--scale F]
                                 workers request different frames at once
+                                --render measures the Source monitor path; --scale 0.03125..=1.0 (default 1.0) applies with --render
   mcp                           MCP server on stdio (headless, or --bridge to the live app)
   help                          this text
   --version                     print the version
@@ -352,9 +353,8 @@ async fn cli_probe(a: &Args) {
     }
 }
 
-fn bench_decode_requests(
-    src: &filmcraft_media::SharedSource,
-    rate: filmcraft_time::FrameRate,
+fn bench_decode_requests<T>(
+    request: impl Fn(i64) -> Result<T, String> + Sync,
     range: std::ops::Range<i64>,
     workers: usize,
 ) -> Vec<(std::time::Instant, std::time::Duration)> {
@@ -374,8 +374,7 @@ fn bench_decode_requests(
                         if f < range.end { Some(f + 1) } else { None }
                     }) {
                         let started = Instant::now();
-                        let frame = src.video_frame(filmcraft_media::FrameRequest::full(rate.tick_of(f)))
-                            .unwrap_or_else(|e| fail(e));
+                        let frame = request(f).unwrap_or_else(|e| fail(e));
                         let elapsed = started.elapsed();
                         drop(frame);
                         samples.lock().unwrap_or_else(PoisonError::into_inner).push((started, elapsed));
@@ -390,8 +389,54 @@ fn bench_decode_requests(
     samples.into_inner().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn bench_decode_scale(a: &Args) -> Result<f32, String> {
+    let text = if a.flag("--scale") { a.opt("--scale").ok_or("--scale needs a value")? } else { "1.0" };
+    let scale: f32 = text.parse().map_err(|_| "--scale must be a number in 0.03125..=1.0")?;
+    if !scale.is_finite() || !(0.03125..=1.0).contains(&scale) {
+        return Err("--scale must be a number in 0.03125..=1.0".into());
+    }
+    Ok(scale)
+}
+
+fn bench_latency(mut samples: Vec<(std::time::Instant, std::time::Duration)>) {
+    let first = samples.iter().min_by_key(|s| s.0).map(|s| s.1).unwrap_or_default();
+    samples.sort_unstable_by_key(|s| s.1);
+    let ms = |i: usize| samples.get(i).map(|s| s.1.as_secs_f64() * 1000.0).unwrap_or_default();
+    let middle = samples.len() / 2;
+    let median = if samples.len() % 2 == 0 { (ms(middle - 1) + ms(middle)) / 2.0 } else { ms(middle) };
+    outln!("request latency ms: first {:.1}, min {:.1}, median {median:.1}, max {:.1}", first.as_secs_f64() * 1000.0, ms(0), ms(samples.len().saturating_sub(1)));
+}
+
+fn bench_render(path: &str, range: std::ops::Range<i64>, workers: usize, scale: f32) -> Result<(), String> {
+    // A headless session has no persistence or watcher. Keep per-user libraries unconfigured.
+    let mut session = Session::default();
+    let imported = session.execute("file.import", json!({"paths": [absolute(path)], "background": false})).map_err(|e| e.to_string())?;
+    let id = imported["items"].as_array().and_then(|items| items.first()).and_then(Value::as_u64).ok_or("import returned no media item")?;
+    let item = filmcraft_project::ItemId(id);
+    let project = session.project.clone();
+    let rate = project.item(item).ok_or("imported media item is missing")?.frame_rate();
+    let provider = session.media.provider(session.project.clone(), session.services.clone());
+    let n = range.end - range.start;
+    let t0 = std::time::Instant::now();
+    let samples = bench_decode_requests(
+        |f| {
+            let image = filmcraft_render::render_item(&project, item, rate.tick_of(f), scale, &provider)
+                .ok_or_else(|| format!("could not render item {id} at frame {f}"))?;
+            drop(image.over_black_with_alpha_rgba8());
+            Ok(())
+        },
+        range,
+        workers,
+    );
+    let dt = t0.elapsed().as_secs_f64();
+    outln!("{n} frames in {dt:.2}s, {:.1} fps, {workers} workers, render item scale {scale}", n as f64 / dt.max(f64::MIN_POSITIVE));
+    bench_latency(samples);
+    Ok(())
+}
+
 async fn cli_bench_decode(a: &Args) {
-    let path = a.pos(1).unwrap_or_else(|| usage("bench-decode <media> [--frames N] [--start F] [--workers N]"));
+    let path = a.pos(1).unwrap_or_else(|| usage("bench-decode <media> [--frames N] [--start F] [--workers N] [--render] [--scale F]"));
+    let scale = bench_decode_scale(a).unwrap_or_else(|e| usage(e));
     for option in ["--frames", "--start", "--workers"] {
         if a.flag(option) && a.opt(option).is_none() {
             usage(format!("{option} needs a value"));
@@ -404,6 +449,10 @@ async fn cli_bench_decode(a: &Args) {
         usage("--frames and --workers must be positive; --start must be non-negative");
     }
     let end = start.checked_add(n).unwrap_or_else(|| usage("frame range is too large"));
+    if a.flag("--render") {
+        bench_render(path, start..end, workers, scale).unwrap_or_else(|e| fail(e));
+        return;
+    }
     #[cfg(any(unix, windows))]
     let src = {
         let path = std::path::Path::new(path);
@@ -418,15 +467,14 @@ async fn cli_bench_decode(a: &Args) {
     let src = filmcraft_codecs::open_bytes(path, read_file(path).await.unwrap_or_else(|e| fail(e)).into()).unwrap_or_else(|e| fail(e));
     let rate = src.info().frame_rate();
     let t0 = std::time::Instant::now();
-    let mut samples = bench_decode_requests(&src, rate, start..end, workers);
+    let samples = bench_decode_requests(
+        |f| src.video_frame(filmcraft_media::FrameRequest::full(rate.tick_of(f))).map_err(|e| e.to_string()),
+        start..end,
+        workers,
+    );
     let dt = t0.elapsed().as_secs_f64();
     outln!("{n} frames in {dt:.2}s, {:.1} fps, {workers} workers", n as f64 / dt.max(f64::MIN_POSITIVE));
-    let first = samples.iter().min_by_key(|s| s.0).map(|s| s.1).unwrap_or_default();
-    samples.sort_unstable_by_key(|s| s.1);
-    let ms = |i: usize| samples.get(i).map(|s| s.1.as_secs_f64() * 1000.0).unwrap_or_default();
-    let middle = samples.len() / 2;
-    let median = if samples.len() % 2 == 0 { (ms(middle - 1) + ms(middle)) / 2.0 } else { ms(middle) };
-    outln!("request latency ms: first {:.1}, min {:.1}, median {median:.1}, max {:.1}", first.as_secs_f64() * 1000.0, ms(0), ms(samples.len().saturating_sub(1)));
+    bench_latency(samples);
     let t1 = std::time::Instant::now();
     let f = src.video_frame(filmcraft_media::FrameRequest::full(rate.tick_of(start + n / 2))).unwrap_or_else(|e| fail(e));
     let (w, h, _) = f.to_linear_f32_decimated(2);
@@ -716,6 +764,19 @@ fn set_custom_bounds(p: &mut Value, start: Option<&str>, end: Option<&str>) {
 
 #[cfg(test)]
 mod format_tests {
+    #[test]
+    fn bench_scale_validation() {
+        let parse = |text: &str| super::Args::parse(text.split_whitespace().map(str::to_string));
+        assert_eq!(super::bench_decode_scale(&parse("bench-decode clip.mov --render")).unwrap(), 1.0);
+        for scale in ["0.03125", "0.5", "1.0"] {
+            assert!(super::bench_decode_scale(&parse(&format!("--render --scale {scale}"))).is_ok());
+        }
+        for scale in ["0", "-1", "0.03124", "1.01", "NaN", "inf", "bad"] {
+            assert!(super::bench_decode_scale(&parse(&format!("--render --scale {scale}"))).is_err());
+        }
+        assert_eq!(super::bench_decode_scale(&parse("--render --scale")).unwrap_err(), "--scale needs a value");
+    }
+
     #[test]
     fn render_reports_the_real_reason() {
         let mut s = filmcraft_engine::Session::default();

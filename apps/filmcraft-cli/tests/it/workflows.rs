@@ -490,3 +490,34 @@ fn end_frame_of(project: &str) -> Option<u64> {
     let v: Value = serde_json::from_slice(&o.stdout).ok()?;
     v["video"][0]["items"][0]["endFrame"].as_u64()
 }
+
+#[test]
+fn bench_decode_render_generated_clip() {
+    let ffmpeg = filmcraft_testkit::require_ffmpeg!();
+    let out = filmcraft_testkit::fixtures_dir("cli/workflows").join("bench-render.mov");
+    let clip = filmcraft_testkit::fixtures::generate(&out, |tmp| {
+        Command::new(&ffmpeg)
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=32x32:rate=24:duration=1"])
+            .args(["-c:v", "prores_ks", "-threads", "1", "-pix_fmt", "yuv422p10le"])
+            .arg(tmp)
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+    .expect("generate tiny ProRes clip");
+    for workers in ["1", "2"] {
+        for scale in ["1", "0.5"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_filmcraft-cli"))
+                .arg("bench-decode")
+                .arg(&clip)
+                .args(["--render", "--scale", scale, "--frames", "3", "--start", "1", "--workers", workers])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let text = String::from_utf8_lossy(&output.stdout);
+            assert!(text.contains("3 frames in"), "{text}");
+            assert!(text.contains(&format!("{workers} workers, render item scale {scale}")), "{text}");
+            assert!(text.contains("request latency ms:"), "{text}");
+            assert!(!text.contains("half-res linear conversion"), "{text}");
+        }
+    }
+}

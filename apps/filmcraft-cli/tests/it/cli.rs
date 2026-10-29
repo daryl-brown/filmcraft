@@ -15,6 +15,18 @@ fn json_out(o: &Output) -> Value {
 }
 
 #[test]
+fn bench_decode_scale_usage_errors() {
+    let missing = cli(&["bench-decode", "unused.mov", "--render", "--scale"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("--scale needs a value"));
+    for scale in ["0", "-1", "0.03124", "1.01", "NaN", "inf", "bad"] {
+        let output = cli(&["bench-decode", "unused.mov", "--render", "--scale", scale]);
+        assert_eq!(output.status.code(), Some(2), "{scale}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--scale must be a number"));
+    }
+}
+
+#[test]
 fn help_and_usage_errors() {
     let h = cli(&["help"]);
     assert!(h.status.success());
