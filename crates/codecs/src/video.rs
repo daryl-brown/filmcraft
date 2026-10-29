@@ -28,6 +28,11 @@ pub trait VideoDecoder: Send {
     fn intra_only(&self) -> bool {
         false
     }
+    /// Whether every picture is independent, using a sample when configuration alone cannot tell.
+    /// A true answer switches the decoder to independent samples and reports [`VideoDecoder::intra_only`].
+    fn detect_intra_only(&mut self, _sample: &[u8]) -> bool {
+        self.intra_only()
+    }
     /// Whether decoding can start at `sample` (`None`: unknown, trust the container's sync flags).
     /// Containers may flag samples as sync that the codec cannot start from (an MP4 without
     /// `stss` marks every sample), so codecs that can tell say so.
@@ -264,6 +269,24 @@ pub fn mjpeg_factory(e: &SampleEntry) -> Option<Result<Box<dyn VideoDecoder>>> {
     matches!(e.codec, CodecConfig::Jpeg { .. }).then(|| Ok(Box::new(MjpegDecoder) as Box<dyn VideoDecoder>))
 }
 
+/// A complete length-prefixed sample with at least one slice and only IDR slices.
+fn h264_idr_sample(sample: &[u8], length_size: usize) -> bool {
+    let Ok(nals) = filmcraft_bitstream::length_prefixed_nals(sample, length_size) else { return false };
+    let mut slices = false;
+    for nal in nals {
+        let Some(&h) = nal.first() else { return false };
+        if h & 0x80 != 0 {
+            return false;
+        }
+        match h & 0x1f {
+            1..=4 => return false,
+            5 => slices = true,
+            _ => {}
+        }
+    }
+    slices
+}
+
 /// Our pure-Rust H.264 decoder (frame-threaded).
 pub struct H264Decoder {
     avcc: Vec<u8>,
@@ -272,6 +295,7 @@ pub struct H264Decoder {
     draft: bool,
     /// Worker threads (a background decoder gets fewer).
     threads: usize,
+    intra: bool,
 }
 
 impl H264Decoder {
@@ -280,8 +304,9 @@ impl H264Decoder {
         if filmcraft_media::cancel::background() { BACKGROUND_H264_THREADS.min(h264_threads()) } else { h264_threads() }
     }
 
-    fn make_inner(avcc: &[u8], threads: usize) -> Result<filmcraft_h264::Decoder> {
-        let mut dec = filmcraft_h264::Decoder::with_threads(threads);
+    fn make_inner(avcc: &[u8], threads: usize, intra: bool) -> Result<filmcraft_h264::Decoder> {
+        let mut dec = if intra { filmcraft_h264::Decoder::with_shared_pool() } else { filmcraft_h264::Decoder::with_threads(threads) };
+        dec.set_intra_only(intra);
         if !avcc.is_empty() {
             dec.configure_avcc(avcc).map_err(h264_error)?;
         }
@@ -291,15 +316,15 @@ impl H264Decoder {
     pub fn new(avcc: Vec<u8>) -> Result<Self> {
         recycle_h264_planes();
         let threads = Self::threads_now();
-        let dec = Self::make_inner(&avcc, threads)?;
+        let dec = Self::make_inner(&avcc, threads, false)?;
         let length_size = avcc_length_size(&avcc);
-        Ok(Self { avcc, dec, length_size, draft: false, threads })
+        Ok(Self { avcc, dec, length_size, draft: false, threads, intra: false })
     }
     /// A decoder for Annex B byte-stream samples (start codes, in-band parameter sets: MXF, TS).
     pub fn annexb() -> Self {
         recycle_h264_planes();
         let threads = Self::threads_now();
-        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::with_threads(threads), length_size: 0, draft: false, threads }
+        Self { avcc: Vec::new(), dec: filmcraft_h264::Decoder::with_threads(threads), length_size: 0, draft: false, threads, intra: false }
     }
     fn convert(p: filmcraft_h264::Picture) -> DecodedFrame {
         use filmcraft_h264::Plane;
@@ -346,20 +371,50 @@ fn h264_error(e: filmcraft_h264::Error) -> CodecError {
 
 impl VideoDecoder for H264Decoder {
     fn decode(&mut self, sample: &[u8], pts: i64) -> Result<Vec<DecodedFrame>> {
-        let pics = self.dec.decode(sample, pts).map_err(h264_error)?;
+        let mut pics = self.dec.decode(sample, pts).map_err(h264_error)?;
+        if self.intra {
+            if pics.is_empty() {
+                pics = self.dec.flush();
+            }
+            if let Some(e) = self.dec.take_error() {
+                return Err(h264_error(e));
+            }
+        }
         Ok(pics.into_iter().map(Self::convert).collect())
     }
     fn flush(&mut self) -> Vec<DecodedFrame> {
         self.dec.flush().into_iter().map(Self::convert).collect()
     }
     fn reset(&mut self) {
-        if let Ok(d) = Self::make_inner(&self.avcc, self.threads) {
+        if let Ok(d) = Self::make_inner(&self.avcc, self.threads, self.intra) {
             self.dec = d;
         }
         self.dec.set_draft(self.draft);
     }
     fn name(&self) -> &str {
         "FilmCraft H.264"
+    }
+    fn intra_only(&self) -> bool {
+        self.intra
+    }
+    fn detect_intra_only(&mut self, sample: &[u8]) -> bool {
+        if self.intra {
+            return true;
+        }
+        let intra = if self.avcc.is_empty() {
+            filmcraft_h264::stream_is_intra_annexb(sample)
+        } else {
+            self.dec.intra_profile_configured() && h264_idr_sample(sample, self.length_size)
+        };
+        if !intra {
+            return false;
+        }
+        let Ok(mut dec) = Self::make_inner(&self.avcc, self.threads, true) else { return false };
+        dec.set_draft(self.draft);
+        self.dec = dec;
+        self.intra = true;
+        self.threads = h264_threads();
+        true
     }
     fn thread_limited(&self) -> bool {
         self.threads < h264_threads()
@@ -384,6 +439,7 @@ impl VideoDecoder for H264Decoder {
 /// (`filmcraft_frame::pool`) instead of the allocator.
 fn recycle_h264_planes() {
     filmcraft_h264::set_plane_allocator(filmcraft_frame::pool::take_u8);
+    filmcraft_h264::set_plane_allocator_u16(filmcraft_frame::pool::take_u16);
 }
 
 /// Worker threads each H.264 decoder uses (frame threading; 1 on wasm).

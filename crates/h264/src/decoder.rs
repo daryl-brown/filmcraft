@@ -16,7 +16,7 @@ use crate::transform::LevelScale;
 use crate::{ColorInfo, Picture};
 use filmcraft_bitstream::{BitReader, annexb_nals, length_prefixed_nals, unescape_rbsp};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// The decoder supports at most 16 reference pictures, so constructing more
 /// inferred gap pictures cannot improve a usable reference list.
@@ -72,14 +72,30 @@ pub struct DecodeStats {
 }
 
 /// State shared with decoding jobs.
-#[derive(Default)]
 struct Shared {
     error: Mutex<Option<Error>>,
     stats: Mutex<DecodeStats>,
     /// Recycled picture buffers.
-    pool: Mutex<Vec<PicState<u8>>>,
-    pool16: Mutex<Vec<PicState<u16>>>,
+    pool: Arc<Mutex<Vec<PicState<u8>>>>,
+    pool16: Arc<Mutex<Vec<PicState<u16>>>>,
+    pool_cap: usize,
 }
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self { error: Mutex::new(None), stats: Mutex::new(DecodeStats::default()), pool: Arc::default(), pool16: Arc::default(), pool_cap: 4 }
+    }
+}
+
+#[derive(Default)]
+struct PicturePools {
+    pool: Arc<Mutex<Vec<PicState<u8>>>>,
+    pool16: Arc<Mutex<Vec<PicState<u16>>>>,
+}
+
+static PICTURE_POOLS: OnceLock<PicturePools> = OnceLock::new();
+#[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
+static WORKER_POOL: OnceLock<Option<Arc<rayon::ThreadPool>>> = OnceLock::new();
 
 /// H.264 decoder.
 pub struct Decoder {
@@ -97,12 +113,13 @@ pub struct Decoder {
     out_queue: VecDeque<Output<FrameRef>>,
     shared: Arc<Shared>,
     #[cfg(feature = "threads")]
-    pool: Option<rayon::ThreadPool>,
+    pool: Option<Arc<rayon::ThreadPool>>,
     in_flight: VecDeque<FrameRef>,
     max_in_flight: usize,
     threads: usize,
     /// Draft mode: skip deblocking of non-reference pictures ([`Decoder::set_draft`]).
     draft: bool,
+    intra_only: bool,
 }
 
 impl Default for Decoder {
@@ -124,6 +141,48 @@ pub fn default_threads() -> usize {
     }
 }
 
+/// Whether an Annex B access unit proves an intra-profile stream with IDR slices only.
+pub fn stream_is_intra_annexb(data: &[u8]) -> bool {
+    std::panic::catch_unwind(|| intra_annexb(data)).unwrap_or(false)
+}
+
+fn intra_annexb(data: &[u8]) -> bool {
+    let mut dec = Decoder::with_threads(1);
+    let mut slices = false;
+    for nal in annexb_nals(data) {
+        let Some((&header, rbsp)) = nal.split_first() else { return false };
+        let Ok(hdr) = NalHeader::parse(header) else { return false };
+        match hdr.nal_unit_type {
+            nal_type::SPS => {
+                let Ok(sps) = Sps::parse(&unescape_rbsp(rbsp)) else { return false };
+                if !sps.is_intra_profile() || dec.handle_nal(nal, 0).is_err() {
+                    return false;
+                }
+            }
+            nal_type::PPS => {
+                if dec.handle_nal(nal, 0).is_err() {
+                    return false;
+                }
+            }
+            nal_type::IDR => {
+                let rbsp = unescape_rbsp(rbsp);
+                let parsed = SliceHeader::parse(&rbsp, hdr, |id| {
+                    let pps = dec.ppss.get(id as usize).and_then(Option::as_ref).ok_or_else(|| Error::Invalid("missing PPS".into()))?;
+                    let sps = dec.spss.get(pps.sps_id as usize).and_then(Option::as_ref).ok_or_else(|| Error::Invalid("missing SPS".into()))?;
+                    Ok((&**pps, &**sps))
+                });
+                if parsed.is_err() {
+                    return false;
+                }
+                slices = true;
+            }
+            nal_type::SLICE | nal_type::SLICE_DPA | nal_type::SLICE_DPB | nal_type::SLICE_DPC => return false,
+            _ => {}
+        }
+    }
+    slices && dec.intra_profile_configured()
+}
+
 impl Decoder {
     /// A decoder using all available cores (with the `threads` feature).
     pub fn new() -> Self {
@@ -135,7 +194,7 @@ impl Decoder {
         crate::cavlc::init_tables();
         #[cfg(feature = "threads")]
         let pool = if threads > 1 && cfg!(not(target_arch = "wasm32")) {
-            rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("h264-{i}")).build().ok()
+            rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("h264-{i}")).build().ok().map(Arc::new)
         } else {
             None
         };
@@ -162,7 +221,41 @@ impl Decoder {
             max_in_flight: threads.max(1) + 2,
             threads: workers,
             draft: false,
+            intra_only: false,
         }
+    }
+
+    /// A per-sample decoder sharing the process worker pool and recycled picture buffers.
+    pub fn with_shared_pool() -> Self {
+        let mut dec = Self::with_threads(1);
+        let pools = PICTURE_POOLS.get_or_init(PicturePools::default);
+        dec.shared = Arc::new(Shared { pool: pools.pool.clone(), pool16: pools.pool16.clone(), pool_cap: 6, ..Shared::default() });
+        dec.max_in_flight = 2;
+        #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
+        {
+            let pool = WORKER_POOL.get_or_init(|| {
+                let threads = default_threads();
+                if threads <= 1 {
+                    return None;
+                }
+                rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("h264-shared-{i}")).build().ok().map(Arc::new)
+            });
+            if let Some(pool) = pool {
+                dec.threads = pool.current_num_threads();
+                dec.pool = Some(pool.clone());
+            }
+        }
+        dec
+    }
+
+    /// Require IDR slices for independently decoded samples.
+    pub fn set_intra_only(&mut self, on: bool) {
+        self.intra_only = on;
+    }
+
+    /// Whether all configured sequence parameter sets promise intra pictures.
+    pub fn intra_profile_configured(&self) -> bool {
+        self.spss.iter().any(Option::is_some) && self.spss.iter().flatten().all(|s| s.is_intra_profile()) && self.ppss.iter().any(Option::is_some)
     }
 
     /// Worker threads decoding pictures (1: on the calling thread).
@@ -248,7 +341,7 @@ impl Decoder {
         let max_queue = self.max_in_flight * 2;
         let mut pics = Vec::new();
         while let Some(o) = self.out_queue.front() {
-            if !o.frame.is_published(o.frame.mb_h() - 1) && self.out_queue.len() <= max_queue {
+            if !o.frame.is_ready() && self.out_queue.len() <= max_queue {
                 break;
             }
             let Some(o) = self.out_queue.pop_front() else { break };
@@ -337,6 +430,9 @@ impl Decoder {
             found = Some((pps.clone(), sps.clone()));
             Ok((&**pps, &**sps))
         })?;
+        if self.intra_only && !sh.idr {
+            return invalid("non-IDR slice in an intra-only stream");
+        }
         let Some((pps, sps)) = found else {
             return Err(Error::MissingParameterSet("PPS".into()));
         };
@@ -478,7 +574,8 @@ impl Decoder {
         let Some(p) = self.pending.take() else { return Ok(()) };
         let PendingPic { frame, sps, first, poc, pts, key, slices } = p;
         let draft = self.draft && first.nal_ref_idc == 0;
-        self.dispatch(frame.clone(), slices, draft);
+        let (cx, cy, cw, ch) = sps.crop_rect();
+        self.dispatch(frame.clone(), slices, draft, (cx as usize, cy as usize, cw as usize, ch as usize));
         self.poc_state.update(&first, &poc);
         if first.nal_ref_idc != 0 {
             self.prev_ref_frame_num = if first.has_mmco5() { 0 } else { first.frame_num };
@@ -491,7 +588,8 @@ impl Decoder {
         Ok(())
     }
 
-    fn dispatch(&mut self, frame: FrameRef, slices: Vec<SliceJob>, draft: bool) {
+    fn dispatch(&mut self, frame: FrameRef, slices: Vec<SliceJob>, draft: bool, crop: (usize, usize, usize, usize)) {
+        frame.expect_output();
         let shared = self.shared.clone();
         #[cfg(feature = "threads")]
         if let Some(pool) = &self.pool {
@@ -502,10 +600,10 @@ impl Decoder {
                 }
             }
             self.in_flight.push_back(frame.clone());
-            pool.spawn_fifo(move || run_job(frame, slices, &shared, draft));
+            pool.spawn_fifo(move || run_job(frame, slices, &shared, draft, crop));
             return;
         }
-        run_job(frame, slices, &shared, draft);
+        run_job(frame, slices, &shared, draft, crop);
     }
 
     fn emit(&mut self, outs: Vec<Output<FrameRef>>) {
@@ -514,15 +612,22 @@ impl Decoder {
 }
 
 /// Decode all slices of one picture and publish its rows.
-fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool) {
+fn run_job(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool, crop: (usize, usize, usize, usize)) {
     if stores_u8(frame.bit_depth, frame.bit_depth) {
-        run_job_as::<u8>(frame, slices, shared, draft, &shared.pool);
+        run_job_as::<u8>(frame, slices, shared, JobEnv { draft, crop, pool: &shared.pool });
     } else {
-        run_job_as::<u16>(frame, slices, shared, draft, &shared.pool16);
+        run_job_as::<u16>(frame, slices, shared, JobEnv { draft, crop, pool: &shared.pool16 });
     }
 }
 
-fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, draft: bool, pool: &Mutex<Vec<PicState<S>>>) {
+struct JobEnv<'a, S: Sample> {
+    draft: bool,
+    crop: (usize, usize, usize, usize),
+    pool: &'a Mutex<Vec<PicState<S>>>,
+}
+
+fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, env: JobEnv<'_, S>) {
+    let JobEnv { draft, crop, pool } = env;
     let reuse = pool.lock().ok().and_then(|mut p| p.pop());
     let mut pic = match reuse {
         Some(mut p) if p.mb_w == frame.mb_w && p.mb_h == frame.mb_h() && p.frame.bit_depth == frame.bit_depth && p.frame.chroma_format_idc == frame.chroma_format_idc => {
@@ -542,7 +647,7 @@ fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared
         pic.flush_rows(true);
         first_err
     }));
-    let err = match result {
+    let mut err = match result {
         Ok(e) => e,
         Err(_) => {
             // Make sure readers never block on this frame.
@@ -557,6 +662,9 @@ fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared
             Some(Error::Invalid("internal error while decoding a picture".into()))
         }
     };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| frame.prepare_output(crop))).is_err() {
+        err.get_or_insert_with(|| Error::Invalid("internal error while preparing a picture".into()));
+    }
     if let Ok(mut s) = shared.stats.lock() {
         s.pictures += 1;
         s.draft_pictures += draft as u64;
@@ -581,10 +689,11 @@ fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared
         slot.get_or_insert(e);
     }
     if let Ok(mut p) = pool.lock()
-        && p.len() < 4
+        && p.len() < shared.pool_cap
     {
         p.push(pic);
     }
+    frame.finish_output();
 }
 
 fn decode_slice<S: Sample>(s: &SliceJob, pic: &mut PicState<S>) -> Result<()> {
@@ -616,7 +725,7 @@ fn output_meta(sps: &Sps, pts: i64, key: bool) -> OutputMeta {
 fn make_picture(o: &Output<FrameRef>) -> Picture {
     let (cx, cy, cw, ch) = o.meta.crop;
     let (cx, cy, cw, ch) = (cx as usize, cy as usize, cw as usize, ch as usize);
-    let (y, u, v) = o.frame.copy_cropped((cx, cy, cw, ch));
+    let (y, u, v) = o.frame.take_output((cx, cy, cw, ch)).unwrap_or_else(|| o.frame.copy_cropped((cx, cy, cw, ch)));
     let (ccw, cch) = (cw.div_ceil(2), ch.div_ceil(16 / o.frame.mb_height_c));
     Picture {
         width: cw as u32,

@@ -36,7 +36,7 @@ mod intra;
 mod mbtypes;
 pub mod params;
 mod picture;
-pub use picture::set_plane_allocator;
+pub use picture::{set_plane_allocator, set_plane_allocator_u16};
 pub mod slice;
 mod slicedec;
 #[cfg(test)]
@@ -44,7 +44,7 @@ mod synth_tests;
 mod tables;
 mod transform;
 
-pub use decoder::{DecodeStats, Decoder, default_threads};
+pub use decoder::{DecodeStats, Decoder, default_threads, stream_is_intra_annexb};
 pub use error::{Error, Result};
 
 /// Colour description from the VUI (ITU-T H.273 code points).
