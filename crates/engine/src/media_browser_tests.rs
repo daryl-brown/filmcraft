@@ -389,7 +389,7 @@ fn file_import_folder_filters_sidecars_and_mirrors_bins() {
 #[test]
 fn mixed_folder_and_file_import_uses_the_target_bin_and_keeps_errors() {
     let mut s = Session::new(Arc::new(folder_fixture()));
-    let bin = s.project.add_bin("Target", None);
+    let bin = s.edit("New Bin", |pr, _| Ok(pr.add_bin("Target", None))).unwrap();
     let r = s.execute("file.import", json!({"paths": ["/empty", "/root", "/outside.wav", "/missing.wav"], "bin": bin.0})).unwrap();
     assert_eq!(r["items"].as_array().unwrap().len(), 4);
     assert_eq!(r["errors"].as_array().unwrap().len(), 2);
@@ -416,8 +416,8 @@ fn empty_and_sidecar_only_folders_import_nothing() {
 fn import_folder_command_matches_file_import_and_requires_path() {
     let mut direct = Session::new(Arc::new(folder_fixture()));
     let mut folder = Session::new(Arc::new(folder_fixture()));
-    let direct_bin = direct.project.add_bin("Target", None);
-    let folder_bin = folder.project.add_bin("Target", None);
+    let direct_bin = direct.edit("New Bin", |pr, _| Ok(pr.add_bin("Target", None))).unwrap();
+    let folder_bin = folder.edit("New Bin", |pr, _| Ok(pr.add_bin("Target", None))).unwrap();
     let a = direct.execute("file.import", json!({"paths": ["/root"], "bin": direct_bin.0})).unwrap();
     let b = folder.execute("file.importFolder", json!({"path": "/root", "bin": folder_bin.0})).unwrap();
     assert_eq!(a, b);

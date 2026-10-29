@@ -223,7 +223,7 @@ fn export_location_browse_works_with_the_runner_and_with_synchronous_pickers() {
 #[test]
 fn import_folder_opens_a_folder_dialog_and_preserves_bin() {
     let mut d = Driver::new(true);
-    let bin = d.app().session.project.add_bin("Target", None);
+    let bin = d.app().session.edit("New Bin", |pr, _| Ok(pr.add_bin("Target", None))).unwrap();
     assert_eq!(d.ok("ui.menu.invoke", json!({"id": "file.importFolder", "params": {"bin": bin.0}})), json!({"dialog": "open"}));
     let (dialog, answer) = d.asked();
     assert!(matches!(dialog, FileDialog::Folder { at: None }));
