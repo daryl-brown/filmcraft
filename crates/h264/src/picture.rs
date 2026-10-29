@@ -1,6 +1,6 @@
 //! Picture buffers and per-macroblock state.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// Storage type of decoded samples: `u8` for 8-bit pictures (half the memory and cache traffic
 /// of 16-bit storage in prediction reads, filters and output), `u16` for higher bit depths.
@@ -145,7 +145,7 @@ impl Sample for u16 {
         dst.copy_from_slice(src);
     }
     fn allocator() -> fn(usize) -> Vec<Self> {
-        Vec::with_capacity
+        plane_allocator_u16()
     }
     fn wrap_plane(samples: Vec<Self>) -> crate::Plane {
         crate::Plane::U16(samples)
@@ -224,6 +224,7 @@ impl MbKind {
 
 /// Per-macroblock state kept for the whole picture (neighbour derivations, deblocking, co-located data).
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct MbState {
     /// Slice number within the picture; `u32::MAX` = not (yet) decoded.
     pub slice_num: u32,
@@ -324,6 +325,14 @@ pub struct Frame {
     pub mb_w: usize,
     pub bit_depth: u32,
     rows: Rows,
+    output: Mutex<Option<PreparedOutput>>,
+    output_job: OnceLock<()>,
+    output_ready: OnceLock<()>,
+}
+
+struct PreparedOutput {
+    crop: (usize, usize, usize, usize),
+    planes: (crate::Plane, crate::Plane, crate::Plane),
 }
 
 /// The value of a published row (waiting for it with the `threads` feature).
@@ -346,7 +355,22 @@ impl Frame {
         }
         let rows = if stores_u8(bit_depth, bit_depth) { cells::<u8>(mb_h) } else { cells::<u16>(mb_h) };
         let mb_height_c = if chroma_format_idc == 2 { 16 } else { 8 };
-        Frame { id, poc, width: mb_w * 16, height: mb_h * 16, cwidth: mb_w * 8, cheight: mb_h * mb_height_c, mb_height_c, chroma_format_idc, mb_w, bit_depth, rows }
+        Frame {
+            id,
+            poc,
+            width: mb_w * 16,
+            height: mb_h * 16,
+            cwidth: mb_w * 8,
+            cheight: mb_h * mb_height_c,
+            mb_height_c,
+            chroma_format_idc,
+            mb_w,
+            bit_depth,
+            rows,
+            output: Mutex::new(None),
+            output_job: OnceLock::new(),
+            output_ready: OnceLock::new(),
+        }
     }
 
     pub fn mb_h(&self) -> usize {
@@ -465,6 +489,41 @@ impl Frame {
         }
     }
 
+    /// Mark this frame as having a job that prepares its output.
+    pub fn expect_output(&self) {
+        let _ = self.output_job.set(());
+    }
+
+    /// Prepare the output after every row has been published.
+    pub fn prepare_output(&self, crop: (usize, usize, usize, usize)) {
+        let planes = self.copy_cropped(crop);
+        *self.output.lock().unwrap_or_else(PoisonError::into_inner) = Some(PreparedOutput { crop, planes });
+    }
+
+    /// Whether the picture can be taken without waiting: its job has finished (after preparing its
+    /// output), or, for a frame without a job, its last row is published.
+    pub fn is_ready(&self) -> bool {
+        if self.output_job.get().is_some() { self.output_ready.get().is_some() } else { self.is_published(self.mb_h().saturating_sub(1)) }
+    }
+
+    /// Signal that output preparation and job error reporting are complete.
+    pub fn finish_output(&self) {
+        let _ = self.output_ready.set(());
+    }
+
+    /// Take prepared planes once, leaving a different crop stored.
+    pub fn take_output(&self, crop: (usize, usize, usize, usize)) -> Option<(crate::Plane, crate::Plane, crate::Plane)> {
+        if self.output_job.get().is_some() {
+            let _ = wait(&self.output_ready);
+        }
+        let mut output = self.output.lock().unwrap_or_else(PoisonError::into_inner);
+        if output.as_ref().is_some_and(|o| o.crop == crop) {
+            output.take().map(|o| o.planes)
+        } else {
+            None
+        }
+    }
+
     /// Crop and copy the frame into planar buffers (waits for completion).
     pub fn copy_cropped(&self, crop: (usize, usize, usize, usize)) -> (crate::Plane, crate::Plane, crate::Plane) {
         match &self.rows {
@@ -501,6 +560,17 @@ static PLANE_ALLOCATOR: std::sync::OnceLock<fn(usize) -> Vec<u8>> = std::sync::O
 /// The host sets it once to recycle the planes of pictures it is done with; the first call wins.
 pub fn set_plane_allocator(alloc: fn(usize) -> Vec<u8>) {
     let _ = PLANE_ALLOCATOR.set(alloc);
+}
+
+static PLANE_ALLOCATOR_U16: OnceLock<fn(usize) -> Vec<u16>> = OnceLock::new();
+
+/// Recycle empty 16-bit output buffers with room for the requested samples. The first call wins.
+pub fn set_plane_allocator_u16(alloc: fn(usize) -> Vec<u16>) {
+    let _ = PLANE_ALLOCATOR_U16.set(alloc);
+}
+
+fn plane_allocator_u16() -> fn(usize) -> Vec<u16> {
+    PLANE_ALLOCATOR_U16.get().copied().unwrap_or(Vec::with_capacity)
 }
 
 fn plane_allocator() -> fn(usize) -> Vec<u8> {

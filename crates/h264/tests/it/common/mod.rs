@@ -1,7 +1,7 @@
 //! Test fixture generation (ffmpeg/libx264 as an external oracle) and comparison helpers.
 #![allow(dead_code)]
 
-use filmcraft_h264::{Decoder, Picture};
+use filmcraft_h264::{DecodeStats, Decoder, Picture};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, PoisonError};
@@ -29,6 +29,87 @@ pub struct Fixture {
 const NOISE: &str = "noise=alls=12:allf=t+u";
 
 pub const FIXTURES: &[Fixture] = &[
+    Fixture {
+        name: "h422_10_s8_cavlc",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:slices=8:cabac=0:8x8dct=1"],
+    },
+    Fixture {
+        name: "h422_10_s8_cabac",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:slices=8:cabac=1:8x8dct=1"],
+    },
+    Fixture {
+        name: "h422_10_s8_cavlc_nodeblock",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:slices=8:cabac=0:8x8dct=1:no-deblock=1"],
+    },
+    Fixture {
+        name: "h422_10_s8_cabac_nodeblock",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:slices=8:cabac=1:8x8dct=1:no-deblock=1"],
+    },
+    Fixture {
+        name: "h422_10_s8_cabac_deblock",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:slices=8:cabac=1:8x8dct=1:deblock=-2,2"],
+    },
+    Fixture {
+        name: "h422_8_s8_cabac",
+        pix_fmt: "yuv422p",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:slices=8:cabac=1:8x8dct=1"],
+    },
+    Fixture {
+        name: "h10_s8_cabac",
+        pix_fmt: "yuv420p10le",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high10", "-x264-params", "keyint=1:slices=8:cabac=1:8x8dct=1"],
+    },
+    Fixture {
+        name: "h422_10_slicemax",
+        pix_fmt: "yuv422p10le",
+        source: "testsrc2",
+        width: 352,
+        height: 288,
+        frames: 6,
+        filter: NOISE,
+        args: &["-profile:v", "high422", "-x264-params", "keyint=1:slice-max-mbs=100:cabac=1:8x8dct=1"],
+    },
+
     Fixture {
         name: "h422_8_cabac0_t0",
         pix_fmt: "yuv422p",
@@ -816,8 +897,21 @@ pub fn decode_file_threads(path: &Path, threads: usize) -> Result<Vec<Picture>, 
 
 /// [`decode_file_threads`] with draft mode ([`Decoder::set_draft`]) on or off.
 pub fn decode_file_opts(path: &Path, threads: usize, draft: bool) -> Result<Vec<Picture>, DecodeFailure> {
+    decode_file_with(path, threads, true, draft).map(|(pictures, _)| pictures)
+}
+
+/// Decode with explicit slice scheduling and retain the completed job counters.
+pub fn decode_file_with(path: &Path, threads: usize, slice_parallel: bool, draft: bool) -> Result<(Vec<Picture>, DecodeStats), DecodeFailure> {
+    let dec = if threads == 0 { Decoder::new() } else { Decoder::with_threads(threads) };
+    decode_file_decoder(path, dec, slice_parallel, draft)
+}
+
+/// Also accepts a decoder using the process-wide worker and picture pools.
+pub fn decode_file_decoder(path: &Path, mut dec: Decoder, slice_parallel: bool, draft: bool) -> Result<(Vec<Picture>, DecodeStats), DecodeFailure> {
     let data = std::fs::read(path).unwrap();
-    let mut dec = if threads == 0 { Decoder::new() } else { Decoder::with_threads(threads) };
+    assert!(dec.slice_parallel(), "slice parallelism is on by default");
+    dec.set_slice_parallel(slice_parallel);
+    assert_eq!(dec.slice_parallel(), slice_parallel);
     assert!(!dec.draft(), "draft mode is off by default");
     dec.set_draft(draft);
     let mut out = Vec::new();
@@ -831,7 +925,7 @@ pub fn decode_file_opts(path: &Path, threads: usize, draft: bool) -> Result<Vec<
     if let Some(e) = dec.take_error() {
         return Err((usize::MAX, e, out));
     }
-    Ok(out)
+    Ok((out, dec.stats()))
 }
 
 /// Compare native 4:2:0 / 4:2:2 samples with byte or little-endian word references.

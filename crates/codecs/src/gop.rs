@@ -153,6 +153,7 @@ struct State {
     decoder: Option<Box<dyn VideoDecoder>>,
     /// The decoder only produces intra pictures: frames decode independently and in parallel.
     intra: bool,
+    no_intra: bool,
     /// Idle decoders for parallel intra decoding.
     spare: Vec<Box<dyn VideoDecoder>>,
     /// Next sample (decode order) to feed, and the sync sample the current run started from.
@@ -521,6 +522,7 @@ impl GopCache {
             state: Mutex::new(State {
                 decoder: None,
                 intra: false,
+                no_intra: false,
                 spare: Vec::new(),
                 next: usize::MAX,
                 start: 0,
@@ -694,8 +696,8 @@ impl GopCache {
             released.extend(st.release_decoder(&self.shared.pool));
         }
         if st.decoder.is_none() {
-            let d = s.make_decoder()?;
-            st.intra = d.intra_only();
+            let mut d = s.make_decoder()?;
+            st.intra = !st.no_intra && (d.intra_only() || s.read(i).map(|b| d.detect_intra_only(&b)).unwrap_or(false));
             st.decoder = Some(d);
             st.next = usize::MAX;
             self.shared.pool.decoders.fetch_add(1, Ordering::Relaxed);
@@ -706,9 +708,14 @@ impl GopCache {
         if filmcraft_media::cancel::cancelled() {
             return Err(CodecError::Cancelled);
         }
-        if st.intra {
-            return self.intra_frame(st, s, i, want_pts);
-        }
+        let mut st = if st.intra {
+            match self.intra_frame(st, s, i, want_pts)? {
+                Some(f) => return Ok(f),
+                None => self.shared.state.lock().unwrap_or_else(PoisonError::into_inner),
+            }
+        } else {
+            st
+        };
         // with the lock held: see `isolated`
         let st = &mut *st;
         isolated(|| self.decode_until(st, s, i, want_pts, late_before, draft))
@@ -858,31 +865,65 @@ impl GopCache {
 
     /// Intra-only streams: decode the one sample outside the lock, so several frame workers
     /// decode different frames of the same source at once.
-    fn intra_frame(&self, st: std::sync::MutexGuard<'_, State>, s: &dyn VideoSamples, i: usize, want_pts: i64) -> crate::Result<Arc<VideoFrame>> {
-        let mut st = st;
+    fn intra_frame(&self, st: std::sync::MutexGuard<'_, State>, s: &dyn VideoSamples, i: usize, want_pts: i64) -> crate::Result<Option<Arc<VideoFrame>>> {
+        drop(st);
+        let data = s.read(i)?;
+        let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.no_intra {
+            return Ok(None);
+        }
         let spare = st.spare.pop();
         drop(st);
         let mut dec = match spare {
             Some(d) => d,
-            None => s.make_decoder()?,
+            None => {
+                let mut d = s.make_decoder()?;
+                if !d.detect_intra_only(&data) {
+                    self.disable_intra(s)?;
+                    return Ok(None);
+                }
+                d
+            }
         };
-        let res = s.read(i).and_then(|data| {
-            DECODED.fetch_add(1, Ordering::Relaxed);
-            timed(|| dec.decode(&data, want_pts))
-        });
-        // crop and rotate before taking the lock: that work runs on rayon (see `isolated`)
+        DECODED.fetch_add(1, Ordering::Relaxed);
+        let res = timed(|| dec.decode(&data, want_pts));
+        if res.as_ref().is_err_and(|e| !matches!(e, CodecError::Cancelled)) {
+            self.disable_intra(s)?;
+            return Ok(None);
+        }
+        // Crop and rotate before taking the lock: that work runs on rayon (see `isolated`).
         let res = res.map(|out| {
             count_frames(&out);
             out.into_iter().map(|d| (d.pts, self.finish(d.frame), d.draft)).collect::<Vec<_>>()
         });
         let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if st.no_intra {
+            return Ok(None);
+        }
         if st.spare.len() < 16 {
             st.spare.push(dec);
         }
         for (pts, frame, draft) in res? {
             self.store_finished(&mut st, pts, frame, draft);
         }
-        st.at_or_before(want_pts, true).ok_or_else(|| CodecError::Decode("frame not produced".into()))
+        st.at_or_before(want_pts, true).map(Some).ok_or_else(|| CodecError::Decode("frame not produced".into()))
+    }
+
+    /// Stop independent decoding and restart the normal path with a fresh decoder.
+    fn disable_intra(&self, s: &dyn VideoSamples) -> crate::Result<()> {
+        let mut released = Vec::new();
+        let mut st = self.shared.state.lock().unwrap_or_else(PoisonError::into_inner);
+        st.intra = false;
+        st.no_intra = true;
+        released.append(&mut st.spare);
+        st.next = usize::MAX;
+        let decoder = s.make_decoder()?;
+        if let Some(old) = st.decoder.replace(decoder) {
+            released.push(old);
+        } else {
+            self.shared.pool.decoders.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 

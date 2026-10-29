@@ -511,13 +511,18 @@ impl Sps {
         n.max(self.max_num_ref_frames as usize).max(1)
     }
 
+    /// Whether the profile and constraint flags promise independently coded pictures.
+    pub fn is_intra_profile(&self) -> bool {
+        matches!(self.profile_idc, 44 | 100 | 110 | 122 | 244) && self.constraint_flags & 0x10 != 0
+    }
+
     /// Number of frames that may precede a frame in decoding order and follow it in output order.
     pub fn max_num_reorder_frames(&self) -> usize {
         if let Some(br) = self.vui.as_ref().and_then(|v| v.bitstream_restriction.as_ref()) {
             return br.max_num_reorder_frames as usize;
         }
         // Profiles that cannot reorder (no B slices) with constraint_set3 (intra) etc.
-        if matches!(self.profile_idc, 44 | 86 | 100 | 110 | 122 | 244) && self.constraint_flags & 0x10 != 0 {
+        if self.is_intra_profile() || (self.profile_idc == 86 && self.constraint_flags & 0x10 != 0) {
             return 0;
         }
         self.max_dpb_frames()

@@ -119,7 +119,11 @@ fn slice_header(w: &mut BitWriter, p: &Pic, cabac: bool) {
 }
 
 fn slice_header_qp(w: &mut BitWriter, p: &Pic, cabac: bool, qp_delta: i32) {
-    w.write_ue(0); // first_mb
+    slice_header_at(w, p, cabac, qp_delta, 0);
+}
+
+fn slice_header_at(w: &mut BitWriter, p: &Pic, cabac: bool, qp_delta: i32, first_mb: u32) {
+    w.write_ue(first_mb);
     w.write_ue(if p.b {
         6
     } else if p.is_p() {
@@ -283,8 +287,12 @@ fn write_pcm(w: &mut BitWriter, samples: &[u8]) {
 }
 
 fn slice_nal(p: &Pic, cabac: bool) -> Vec<u8> {
+    slice_nal_at(p, cabac, 0)
+}
+
+fn slice_nal_at(p: &Pic, cabac: bool, first_mb: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
-    slice_header(&mut w, p, cabac);
+    slice_header_at(&mut w, p, cabac, 0, first_mb);
     if !cabac && p.b {
         w.write_ue(NMB as u32);
         w.rbsp_trailing();
@@ -336,12 +344,31 @@ fn slice_nal(p: &Pic, cabac: bool) -> Vec<u8> {
                 write_pcm(&mut w, s);
                 e.init();
             }
-            e.terminate(&mut w, i + 1 == NMB); // end_of_slice_flag
+            e.terminate(&mut w, i + 1 == p.mbs.len()); // end_of_slice_flag
         }
         w.align_zero();
     }
     let t = if p.idr { 5 } else { 1 };
     nal(p.ref_idc, t, &w.finish())
+}
+
+/// The same PCM samples encoded as one slice or two complete row bands.
+#[cfg(feature = "threads")]
+pub(super) fn pcm_row_bands(cabac: bool, bands: bool) -> Vec<u8> {
+    let mut seed = 731u32;
+    let mbs = (0..NMB).map(|_| Some(random_mb(&mut seed))).collect();
+    let p = Pic { idr: true, ref_idc: 3, mbs, ..Default::default() };
+    let mut stream = sps(if cabac { 77 } else { 66 }, 2, false, PocType::T2);
+    stream.extend(pps(cabac, false));
+    if bands {
+        for (first, end) in [(0, MB_W), (MB_W, NMB)] {
+            let band = Pic { mbs: p.mbs[first..end].to_vec(), ..p.clone() };
+            stream.extend(slice_nal_at(&band, cabac, first as u32));
+        }
+    } else {
+        stream.extend(slice_nal(&p, cabac));
+    }
+    stream
 }
 
 fn random_mb(seed: &mut u32) -> Vec<u8> {
@@ -1081,5 +1108,138 @@ fn draft_422_non_reference_intra_picture() {
             let stats = decoder.stats();
             assert_eq!((stats.pictures, stats.draft_pictures, stats.slices_i), (2, 1, 2));
         }
+    }
+}
+
+fn intra_sps() -> Vec<u8> {
+    let mut bytes = depth_sps(10, 10, 2, false);
+    bytes[6] = 0x10; // constraint_set3_flag, after the start code, header and profile.
+    bytes
+}
+
+fn intra_access_unit(idr: bool) -> Vec<u8> {
+    let mut bytes = intra_sps();
+    bytes.extend(pps(false, false));
+    bytes.extend(chroma_pcm_slice(10, false, idr, 0, 2));
+    bytes
+}
+
+#[test]
+fn stream_is_intra_annexb_profiles_and_slices() {
+    assert!(crate::stream_is_intra_annexb(&intra_access_unit(true)));
+    assert!(!crate::stream_is_intra_annexb(&intra_access_unit(false)));
+    let mut high = depth_sps(8, 8, 1, false);
+    high[5] = 100;
+    high.extend(pps(false, false));
+    high.extend(depth_pcm_slice(8, false, true, 0));
+    assert!(!crate::stream_is_intra_annexb(&high));
+    let mut missing_pps = intra_sps();
+    missing_pps.extend(chroma_pcm_slice(10, false, true, 0, 2));
+    assert!(!crate::stream_is_intra_annexb(&missing_pps));
+    let mut missing_sps = pps(false, false);
+    missing_sps.extend(chroma_pcm_slice(10, false, true, 0, 2));
+    assert!(!crate::stream_is_intra_annexb(&missing_sps));
+    let mut missing_slice = intra_sps();
+    missing_slice.extend(pps(false, false));
+    assert!(!crate::stream_is_intra_annexb(&missing_slice));
+    let mut mixed = intra_access_unit(true);
+    mixed.extend(depth_sps(8, 8, 1, false));
+    assert!(!crate::stream_is_intra_annexb(&mixed));
+    for t in 1..=4 {
+        let mut partition = intra_access_unit(true);
+        partition.extend(nal(3, t, &[0x80]));
+        assert!(!crate::stream_is_intra_annexb(&partition));
+    }
+}
+
+#[test]
+fn stream_is_intra_annexb_hostile_input() {
+    for bytes in [&[][..], &[0x73, 0x19, 0xfe, 0x82][..], &[0, 0, 1, 0xe7, 0x80][..]] {
+        assert!(!crate::stream_is_intra_annexb(bytes));
+    }
+    let valid = intra_access_unit(true);
+    // A truncated header must never escape the detector as a panic.
+    for end in 0..valid.len() {
+        assert!(std::panic::catch_unwind(|| crate::stream_is_intra_annexb(&valid[..end])).is_ok());
+    }
+    for i in 0..valid.len() {
+        let mut damaged = valid.clone();
+        damaged[i] ^= 0xff;
+        assert!(std::panic::catch_unwind(|| crate::stream_is_intra_annexb(&damaged)).is_ok());
+    }
+    let mut bad_sps = intra_access_unit(true);
+    bad_sps.extend(nal(3, 7, &[0x80]));
+    assert!(!crate::stream_is_intra_annexb(&bad_sps));
+    let mut bad_pps = intra_access_unit(true);
+    bad_pps.extend(nal(3, 8, &[]));
+    assert!(!crate::stream_is_intra_annexb(&bad_pps));
+    let mut bad_slice = intra_sps();
+    bad_slice.extend(pps(false, false));
+    bad_slice.extend(nal(3, 5, &[]));
+    assert!(!crate::stream_is_intra_annexb(&bad_slice));
+}
+
+#[test]
+fn intra_only_rejects_non_idr_and_accepts_idr() {
+    let mut dec = Decoder::with_threads(1);
+    dec.set_intra_only(true);
+    assert!(matches!(dec.decode(&intra_access_unit(false), 0), Err(crate::Error::Invalid(message)) if message == "non-IDR slice in an intra-only stream"));
+    assert_eq!(dec.stats().pictures, 0);
+    let mut pics = dec.decode(&intra_access_unit(true), 1).unwrap();
+    pics.extend(dec.flush());
+    assert!(dec.take_error().is_none());
+    assert_eq!(pics.len(), 1);
+    assert!(pics[0].key);
+}
+
+#[test]
+fn intra_profile_configuration_requires_sps_and_pps() {
+    let mut dec = Decoder::with_threads(1);
+    assert!(!dec.intra_profile_configured());
+    dec.decode(&intra_sps(), 0).unwrap();
+    assert!(!dec.intra_profile_configured());
+    dec.decode(&pps(false, false), 0).unwrap();
+    assert!(dec.intra_profile_configured());
+    dec.decode(&depth_sps(10, 10, 2, false), 0).unwrap();
+    assert!(!dec.intra_profile_configured());
+}
+
+#[test]
+fn prepared_output_matches_crop_once() {
+    use crate::picture::{Frame, Planes};
+
+    for depth in [8, 10] {
+        let frame = if depth == 8 {
+            Frame::from_planes(1, 0, &Planes::<u8>::gray(32, 32, depth, 1), depth)
+        } else {
+            Frame::from_planes(1, 0, &Planes::<u16>::gray(32, 32, depth, 2), depth)
+        };
+        let crop = (2, 2, 24, 24);
+        let expected = frame.copy_cropped(crop);
+        assert!(frame.take_output(crop).is_none());
+        frame.prepare_output(crop);
+        assert!(frame.take_output((0, 0, 32, 32)).is_none());
+        assert_eq!(frame.take_output(crop), Some(expected));
+        assert!(frame.take_output(crop).is_none());
+    }
+}
+
+#[test]
+fn shared_pool_matches_serial_idr_pixels() {
+    for (depth, format) in [(8, 1), (10, 1), (10, 2)] {
+        let mut stream = depth_sps(depth, depth, format, false);
+        stream.extend(pps(false, false));
+        stream.extend(chroma_pcm_slice(depth, false, true, 0, format as u8));
+        let mut serial = Decoder::with_threads(1);
+        let mut shared = Decoder::with_shared_pool();
+        let mut expected = serial.decode(&stream, 7).unwrap();
+        expected.extend(serial.flush());
+        let mut actual = shared.decode(&stream, 7).unwrap();
+        actual.extend(shared.flush());
+        assert!(serial.take_error().is_none());
+        assert!(shared.take_error().is_none());
+        assert_eq!(expected.len(), 1);
+        assert_eq!(actual.len(), 1);
+        assert_eq!((&actual[0].y, &actual[0].u, &actual[0].v), (&expected[0].y, &expected[0].u, &expected[0].v));
     }
 }

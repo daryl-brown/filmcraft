@@ -18,6 +18,15 @@ macro_rules! fixture_tests {
 }
 
 fixture_tests!(
+    h422_10_s8_cavlc,
+    h422_10_s8_cabac,
+    h422_10_s8_cavlc_nodeblock,
+    h422_10_s8_cabac_nodeblock,
+    h422_10_s8_cabac_deblock,
+    h422_8_s8_cabac,
+    h10_s8_cabac,
+    h422_10_slicemax,
+
     h422_8_cabac0_t0,
     h422_8_cabac0_t1,
     h422_8_cabac1_t0,
