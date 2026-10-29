@@ -434,3 +434,13 @@ frame-size ratio. Intrinsic effects (Motion, Opacity…) replace the clip's own 
 effects are added. Applying is one undo step; saving, renaming, deleting and importing change the
 library, not the project, and are not undoable. Files with another `format`, a newer `version` or
 unknown effect ids are refused.
+
+### Importing folders
+
+`file.import {paths: [path], bin?}` accepts files and folders together. File > Import Folder
+(`file.importFolder {path, bin?}`) and dropping a folder use the same importer. Each folder with
+media becomes a bin, with sub-folders nested inside it. Folder walks import video, audio and
+images only; select interchange documents and captions explicitly to import them. The result
+includes `items`, `bins`, `errors` and `skipped`. `skipped` counts recognised project and caption
+files omitted by the walk; unknown extensions are hidden by the directory listing and are not
+counted. Walks are limited to 4096 folders and depth 32.

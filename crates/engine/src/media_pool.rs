@@ -279,6 +279,7 @@ impl MediaPool {
     /// Read and open a file through `services` (through its random-access reader when the host
     /// has one: containers then read only their index now and samples on demand).
     pub fn open_file(&self, path: &str, services: &dyn Services) -> Result<SharedSource, MediaError> {
+        let _scope = crate::watchdog::scope("media.open", path);
         let io = |e: std::io::Error| if e.kind() == std::io::ErrorKind::NotFound { MediaError::Offline(e.to_string()) } else { MediaError::Io(e.to_string()) };
         if let Some(r) = services.reader(path) {
             let openers = self.openers.read().unwrap_or_else(PoisonError::into_inner).clone();
@@ -292,6 +293,7 @@ impl MediaPool {
     /// format without a streaming reader is read whole only up to [`PROBE_WHOLE_FILE_MAX`] bytes
     /// (#157). Hosts without random-access readers open the file as [`Self::open_file`] does.
     pub fn probe_file(&self, path: &str, services: &dyn Services) -> Result<SharedSource, MediaError> {
+        let _scope = crate::watchdog::scope("media.probe", path);
         let Some(r) = services.reader(path) else { return self.open_file(path, services) };
         let r = r.map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { MediaError::Offline(e.to_string()) } else { MediaError::Io(e.to_string()) })?;
         let openers = self.openers.read().unwrap_or_else(PoisonError::into_inner).clone();
@@ -336,6 +338,7 @@ impl MediaPool {
             }
             MediaRef::File { path } => match self.follow_media(path).and_then(|file| {
                 if m.info.kind == filmcraft_media::MediaKind::ImageSequence {
+                    let _scope = crate::watchdog::scope("media.open", path);
                     open_image_sequence(&file, services, m.info.frame_rate(), &it.name)
                 } else {
                     self.open_file(&file, services)

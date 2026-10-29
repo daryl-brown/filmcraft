@@ -24,12 +24,27 @@ impl FilmcraftApp {
                         return Ok(Value::Null);
                     }
                     let bin = bin.unwrap_or_else(|| json!(app.import_bin().0));
-                    let r = app.session.execute("file.import", json!({"paths": paths, "bin": bin})).map_err(|e| e.to_string());
+                    let r = app.session.execute("file.import", json!({"paths": paths, "bin": bin, "background": true})).map_err(|e| e.to_string());
                     if let Ok(v) = &r
                         && let Some(errs) = v.get("errors").and_then(Value::as_array)
                         && !errs.is_empty()
                     {
                         app.ui.status = errs.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ");
+                    }
+                    r
+                })
+            }
+            "file.importFolder" => {
+                let bin = params.get("bin").cloned();
+                self.pick(FileDialog::Folder { at: None }, move |app, paths| {
+                    let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
+                    let bin = bin.unwrap_or_else(|| json!(app.import_bin().0));
+                    let r = app.session.execute("file.import", json!({"paths": [path], "bin": bin, "background": true})).map_err(|e| e.to_string());
+                    if let Ok(v) = &r
+                        && let Some(errors) = v.get("errors").and_then(Value::as_array)
+                        && !errors.is_empty()
+                    {
+                        app.ui.status = errors.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ");
                     }
                     r
                 })

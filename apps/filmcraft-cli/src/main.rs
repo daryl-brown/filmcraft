@@ -291,6 +291,20 @@ fn absolute(path: &str) -> String {
 
 #[tokio::main]
 async fn main() {
+    use filmcraft_engine::watchdog;
+    let stall_ms = std::env::var("FILMCRAFT_STALL_MS").ok();
+    let _watchdog = watchdog::threshold_from_env(stall_ms.as_deref(), None).and_then(|threshold| {
+        watchdog::watch_current_thread();
+        match watchdog::start(watchdog::Monitor::global(), watchdog::Config::new(threshold), std::sync::Arc::new(|report| {
+            diag(format_args!("filmcraft-cli: {report}"));
+        })) {
+            Ok(handle) => Some(handle),
+            Err(error) => {
+                diag(format_args!("filmcraft-cli: could not start stall watchdog: {error}"));
+                None
+            }
+        }
+    });
     cli().await;
     if STDOUT_ERROR.load(Ordering::Relaxed) {
         std::process::exit(1);

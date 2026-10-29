@@ -118,3 +118,17 @@ buttons use `craft-ui::layout::fit_toolbar`; commands beyond the available width
 through More, including their selected state and Source/Program routing. A scrolling fallback
 retains all commands if even More cannot fit. `monitor_geometry` checks the painted readouts,
 control bounds, overflow actions and Source drag payloads across monitor widths and themes.
+
+## Background file imports
+
+File > Import, File > Import Folder and OS file drops request `file.import` with
+`background: true`. Folder listing and media opening run in the engine's import job;
+the status bar shows its label, current file and elapsed opening time with the existing
+cancel control. Cancellation takes effect between files and retains files already opened.
+Documents and image sequences still import immediately.
+
+A timeline drop retains its pointer and viewport until the matching import outcome arrives.
+Normal frame polling drains outcomes once and places the imported items at that saved point.
+`timeline_drop_ui::gated_timeline_drop_places_the_outcome_at_the_saved_pointer` covers a
+blocked open and pointer movement during the wait. The existing drop tests wait through
+normal frame polling. These tests require execution with a Rust toolchain to verify them.

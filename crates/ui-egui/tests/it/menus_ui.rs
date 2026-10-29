@@ -360,3 +360,19 @@ fn saved_projects_are_listed_in_home_and_open_recent() {
     assert!(!menus.as_array().unwrap().iter().any(|m| m["id"].as_str().is_some_and(|id| id.starts_with("file.openRecent."))));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn import_folder_from_the_file_menu() {
+    let dir = std::env::temp_dir().join(format!("fc-ui-import-folder-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([10u8, 20, 30, 255])).save(dir.join("still.png")).unwrap();
+    let mut d = Driver::new();
+    let menus = d.ok("ui.menu.list", json!({}));
+    let item = menus.as_array().unwrap().iter().find(|m| m["id"] == "file.importFolder").unwrap();
+    assert_eq!(item["path"], json!(["File"]));
+    let r = d.ok("ui.menu.invoke", json!({"id": "file.importFolder", "params": {"path": dir.to_string_lossy()}}));
+    assert_eq!(r["items"].as_array().unwrap().len(), 1);
+    assert_eq!(r["bins"].as_array().unwrap().len(), 1);
+    assert_eq!(r["errors"], json!([]));
+    let _ = std::fs::remove_dir_all(&dir);
+}

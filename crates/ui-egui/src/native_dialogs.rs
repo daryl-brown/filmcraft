@@ -125,7 +125,11 @@ impl FilmcraftApp {
             self.native_dialog = Some(PendingDialog { answer: run(dialog), then: Box::new(then) });
             return Ok(json!({"dialog": "open"}));
         }
-        let paths = dialog.run_now(&mut self.hooks);
+        // The user may keep a modal picker open for as long as they like: that is not a stall.
+        let paths = {
+            let _pause = filmcraft_engine::watchdog::pause();
+            dialog.run_now(&mut self.hooks)
+        };
         then(self, paths)
     }
 

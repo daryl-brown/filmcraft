@@ -12,7 +12,7 @@ mod files;
 mod frame;
 mod gpu;
 mod ime;
-mod input;
+pub(crate) mod input;
 mod keys;
 mod playback;
 mod prefs;
@@ -100,6 +100,7 @@ impl FilmcraftApp {
             last_timeline_width: 1000.0,
             timeline_view_of: None,
             pending_timeline_drop: None,
+            pending_import_drops: Vec::new(),
             file_drag_hover: None,
             window_files: Vec::new(),
             timeline_view_last: None,
@@ -472,6 +473,7 @@ impl eframe::App for FilmcraftApp {
     /// Eframe's hidden logic callback: run the logic pass, sync the IME target context, then
     /// suspend reset state because a logic-only callback is never a UI pass.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let _scope = filmcraft_engine::watchdog::scope("ui pass", "logic");
         self.logic_inner(ctx);
         self.finish_ime_reset_logic(ctx);
     }
@@ -492,6 +494,7 @@ impl eframe::App for FilmcraftApp {
     /// Eframe's UI entry: begin this pass's IME reset state, suspend custom controls when no
     /// eligible editor owns input, draw `ui_inner`, then run end-of-pass IME reconciliation.
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let _scope = filmcraft_engine::watchdog::scope("ui pass", "ui");
         let ctx = ui.ctx().clone();
         self.ime_reset.begin_pass(&ctx);
         self.ime_drawn_editor = None;

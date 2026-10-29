@@ -11,9 +11,9 @@ use crate::{Services, Session};
 
 /// An in-memory filesystem: directories and files (with bytes).
 #[derive(Default)]
-struct FakeFs {
-    dirs: Vec<String>,
-    files: Mutex<BTreeMap<String, Vec<u8>>>,
+pub(crate) struct FakeFs {
+    pub(crate) dirs: Vec<String>,
+    pub(crate) files: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 impl FakeFs {
@@ -326,4 +326,141 @@ fn ale_logs_are_not_offered_for_import() {
     assert_eq!(media_browser::kind_of("clips.ale"), None);
     assert!(!media_browser::extensions().contains(&"ale"));
     assert_eq!(media_browser::kind_of("cut.edl"), Some("project"));
+}
+
+pub(crate) fn folder_fixture() -> FakeFs {
+    let mut fs = FakeFs::default();
+    fs.dirs = ["/root", "/root/A", "/root/A/sub", "/root/B", "/empty", "/sidecars"].map(String::from).to_vec();
+    let files = fs.files.get_mut().unwrap();
+    let wav = filmcraft_media::wav::write_wav16(&[0.0; 4800], 2, 48_000);
+    for path in ["/root/A/a1.wav", "/root/A/sub/s1.wav", "/outside.wav"] {
+        files.insert(path.into(), wav.clone());
+    }
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([10u8, 20, 30, 255])).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    files.insert("/root/B/b1.png".into(), png.into_inner());
+    for path in ["/root/A/a1M01.XML", "/root/A/notes.srt", "/root/MEDIAPRO.XML", "/root/readme.txt", "/sidecars/clip.XML", "/sidecars/subs.vtt"] {
+        files.insert(path.into(), b"sidecar".to_vec());
+    }
+    fs
+}
+
+fn child_bin<'a>(bin: &'a filmcraft_project::Bin, name: &str) -> &'a filmcraft_project::Bin {
+    bin.children
+        .iter()
+        .find_map(|entry| match entry {
+            filmcraft_project::BinEntry::Bin(child) if child.name == name => Some(child),
+            _ => None,
+        })
+        .unwrap()
+}
+
+fn bin_items(s: &Session, bin: &filmcraft_project::Bin) -> Vec<String> {
+    bin.children
+        .iter()
+        .filter_map(|entry| match entry {
+            filmcraft_project::BinEntry::Item(id) => Some(s.project.item(*id).unwrap().name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn file_import_folder_filters_sidecars_and_mirrors_bins() {
+    for command in ["file.import", "mediaBrowser.import"] {
+        let mut s = Session::new(Arc::new(folder_fixture()));
+        let r = s.execute(command, json!({"paths": ["/root"]})).unwrap();
+        assert_eq!(r["items"].as_array().unwrap().len(), 3, "{r}");
+        assert_eq!(r["bins"].as_array().unwrap().len(), 4, "{r}");
+        assert_eq!(r["skipped"], 3);
+        assert_eq!(r["errors"], json!([]));
+        assert!(r["sequences"].as_array().is_none_or(Vec::is_empty));
+        assert!(r["documents"].as_array().is_none_or(Vec::is_empty));
+        assert_eq!(s.project.items.len(), 3);
+        let root = child_bin(&s.project.root, "root");
+        assert!(bin_items(&s, root).is_empty());
+        let a = child_bin(root, "A");
+        assert_eq!(bin_items(&s, a), ["a1.wav"]);
+        assert_eq!(bin_items(&s, child_bin(a, "sub")), ["s1.wav"]);
+        assert_eq!(bin_items(&s, child_bin(root, "B")), ["b1.png"]);
+    }
+}
+
+#[test]
+fn mixed_folder_and_file_import_uses_the_target_bin_and_keeps_errors() {
+    let mut s = Session::new(Arc::new(folder_fixture()));
+    let bin = s.project.add_bin("Target", None);
+    let r = s.execute("file.import", json!({"paths": ["/empty", "/root", "/outside.wav", "/missing.wav"], "bin": bin.0})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 4);
+    assert_eq!(r["errors"].as_array().unwrap().len(), 2);
+    assert_eq!(r["skipped"], 3);
+    let target = child_bin(&s.project.root, "Target");
+    assert_eq!(bin_items(&s, target), ["outside.wav"]);
+    assert_eq!(child_bin(target, "root").name, "root");
+}
+
+#[test]
+fn empty_and_sidecar_only_folders_import_nothing() {
+    for command in ["file.import", "mediaBrowser.import"] {
+        for path in ["/empty", "/sidecars"] {
+            let mut s = Session::new(Arc::new(folder_fixture()));
+            let e = s.execute(command, json!({"paths": [path]})).unwrap_err().to_string();
+            assert!(e.contains(&format!("no media files in {path}")), "{e}");
+            assert!(s.project.items.is_empty());
+            assert!(s.project.root.children.is_empty());
+        }
+    }
+}
+
+#[test]
+fn import_folder_command_matches_file_import_and_requires_path() {
+    let mut direct = Session::new(Arc::new(folder_fixture()));
+    let mut folder = Session::new(Arc::new(folder_fixture()));
+    let direct_bin = direct.project.add_bin("Target", None);
+    let folder_bin = folder.project.add_bin("Target", None);
+    let a = direct.execute("file.import", json!({"paths": ["/root"], "bin": direct_bin.0})).unwrap();
+    let b = folder.execute("file.importFolder", json!({"path": "/root", "bin": folder_bin.0})).unwrap();
+    assert_eq!(a, b);
+    let e = folder.execute("file.importFolder", json!({})).unwrap_err().to_string();
+    assert!(e.contains("need `path`"), "{e}");
+    for path in [Value::Null, json!(12), json!([])] {
+        assert!(folder.execute("file.importFolder", json!({"path": path})).is_err());
+    }
+}
+
+#[test]
+fn explicit_xml_import_is_not_filtered_even_with_a_folder() {
+    let mut source = Session::default();
+    source.execute("file.openDemoProject", json!({})).unwrap();
+    let (xml, _) = filmcraft_interchange::export(
+        &source.project,
+        source.state.active_sequence.unwrap(),
+        filmcraft_interchange::Format::Fcp7Xml,
+        &filmcraft_interchange::ExportOptions::default(),
+    )
+    .unwrap();
+    for with_folder in [false, true] {
+        let mut fs = folder_fixture();
+        fs.files.get_mut().unwrap().insert("/cut.xml".into(), xml.clone());
+        let mut s = Session::new(Arc::new(fs));
+        let paths = if with_folder { vec!["/root", "/cut.xml"] } else { vec!["/cut.xml"] };
+        let r = s.execute("file.import", json!({"paths": paths})).unwrap();
+        assert_eq!(r["sequences"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(r["documents"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(r["errors"], json!([]));
+        if with_folder {
+            assert_eq!(r["skipped"], 3);
+            assert_eq!(r["items"].as_array().unwrap().len(), 3);
+        }
+    }
+}
+
+#[test]
+fn empty_folder_does_not_hide_an_explicit_file() {
+    let mut s = Session::new(Arc::new(folder_fixture()));
+    let r = s.execute("file.import", json!({"paths": ["/sidecars", "/outside.wav"]})).unwrap();
+    assert_eq!(r["items"].as_array().unwrap().len(), 1);
+    assert_eq!(r["bins"], json!([]));
+    assert_eq!(r["skipped"], 2);
+    assert_eq!(r["errors"], json!(["no media files in /sidecars"]));
 }
