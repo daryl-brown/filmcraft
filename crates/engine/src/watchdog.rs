@@ -3,7 +3,9 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, ThreadId};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use web_time::Instant;
 
 #[derive(Default)]
 struct State {
@@ -296,7 +298,9 @@ mod tests {
     use super::start;
     #[cfg(not(target_arch = "wasm32"))]
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+
+    use web_time::Instant;
 
     fn stack(now: Instant, id: u64) -> Snapshot {
         Snapshot { scopes: vec![(id, "file.import (Z:\\a.mxf)".into(), now), (id + 1, "media.open (Z:\\a.mxf)".into(), now)] }
