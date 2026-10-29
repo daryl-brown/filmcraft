@@ -8,8 +8,8 @@ use filmcraft_edit::{Edge, TrimMode};
 use filmcraft_media::Generator;
 use filmcraft_media::generators::GeneratorSource;
 use filmcraft_project::{
-    ClipId, ItemId, ItemKind, Label, Marker, MarkerId, MarkerKind, MediaClip, MediaRef, ParamValue, Project, SequenceSettings, Track, TrackId, TrackKind,
-    Transition, TransitionId, resolve_auto_points,
+    AudioChannels, ClipId, ItemId, ItemKind, Label, Marker, MarkerId, MarkerKind, MediaClip, MediaRef, ParamValue, Project, SequenceSettings, Track, TrackId,
+    TrackKind, Transition, TransitionId, resolve_auto_points,
 };
 use filmcraft_time::{FrameRate, TICKS_PER_SECOND, Tick, TimeRange, parse_timecode};
 use serde_json::{Value, json};
@@ -742,6 +742,18 @@ fn detect_image_sequence(s: &Session, path: &str) -> bool {
     filmcraft_media::sequence::Numbered::parse(path).is_some() && crate::media_pool::image_sequence_frames(path, &*s.services).is_ok_and(|f| f.len() > 1)
 }
 
+/// The import layout of stream 0; other container streams keep their own layout.
+pub(crate) fn default_audio_channels(format_pref: &str, channels: usize) -> Option<filmcraft_project::AudioChannelMap> {
+    if channels <= 2 || format_pref == "asIs" {
+        return None;
+    }
+    let format = if format_pref == "stereo" { AudioChannels::Stereo } else { AudioChannels::Mono };
+    let n = u16::try_from(channels).unwrap_or(u16::MAX);
+    let mut map = filmcraft_project::AudioChannelMap::for_format(format, n);
+    map.clips.truncate(crate::sequence_tools::MAX_TRACKS);
+    Some(map)
+}
+
 fn import_source(
     s: &mut Session,
     path: &str,
@@ -751,6 +763,12 @@ fn import_source(
     bin: Option<filmcraft_project::BinId>,
 ) -> Result<ItemId> {
     let mut info = src.info().clone();
+    let interpret = filmcraft_project::Interpretation {
+        audio_channels: info.audio().and_then(|a| {
+            default_audio_channels(&s.prefs.media.default_audio_channels, usize::try_from(a.channels).unwrap_or(usize::MAX))
+        }),
+        ..Default::default()
+    };
     // Settings ▸ Labels ▸ Label Defaults
     let label = s.prefs.labels.for_media(info.kind, info.has_video(), info.has_audio());
     // Settings ▸ Media ▸ Indeterminate Media Timebase: the frame rate stills report
@@ -768,7 +786,7 @@ fn import_source(
             ItemKind::Media(Box::new(MediaClip {
                 media: MediaRef::File { path: path_s },
                 info,
-                interpret: Default::default(),
+                interpret,
                 mark_in: None,
                 mark_out: None,
                 markers: vec![],

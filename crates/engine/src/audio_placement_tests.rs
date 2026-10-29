@@ -225,3 +225,181 @@ fn hostile_track_counts_are_an_error_not_a_crash() {
     assert!(ensure_audio_tracks(&mut p, seq, 0, 1_000_000, "test").is_err());
     assert!(ensure_audio_tracks(&mut p, ItemId(u64::MAX), 0, 1, "test").is_err());
 }
+
+#[test]
+fn multichannel_import_defaults_cover_formats_and_caps() {
+    use filmcraft_project::AudioChannelMap;
+
+    use crate::commands::default_audio_channels;
+    for pref in ["mono", "stereo", "asIs", "unknown"] {
+        for channels in [0, 1, 2, 3, 6, 8, usize::MAX] {
+            let got = default_audio_channels(pref, channels);
+            if channels <= 2 || pref == "asIs" {
+                assert_eq!(got, None, "{pref}, {channels}");
+                continue;
+            }
+            let format = if pref == "stereo" { AudioChannels::Stereo } else { AudioChannels::Mono };
+            let mut want = AudioChannelMap::for_format(format, u16::try_from(channels).unwrap_or(u16::MAX));
+            want.clips.truncate(crate::sequence_tools::MAX_TRACKS);
+            assert_eq!(got, Some(want), "{pref}, {channels}");
+            if channels == usize::MAX {
+                let map = default_audio_channels(pref, channels).unwrap();
+                assert_eq!(map.clips.len(), crate::sequence_tools::MAX_TRACKS);
+                let last = u16::try_from(crate::sequence_tools::MAX_TRACKS - 1).unwrap();
+                let expected = if pref == "stereo" { vec![last * 2, last * 2 + 1] } else { vec![last] };
+                assert_eq!(map.clips.last(), Some(&expected));
+            }
+        }
+    }
+    assert_eq!(default_audio_channels("stereo", 3).unwrap().clips, vec![vec![0, 1], vec![2]]);
+}
+
+/// Exact binary fractions remain distinguishable after the fixture's 16-bit PCM encoding.
+fn multichannel_wav(channels: u16) -> Vec<u8> {
+    let samples: Vec<f32> = (0..4800).flat_map(|_| (0..channels).map(|k| f32::from(k + 1) / 128.0)).collect();
+    filmcraft_media::wav::write_wav16(&samples, channels, 48_000)
+}
+
+fn import_multichannel(s: &mut Session, channels: u16) -> ItemId {
+    crate::commands::import_bytes(s, "/multichannel.wav", multichannel_wav(channels).into(), None).unwrap()
+}
+
+fn sequence_from_audio(s: &mut Session, item: ItemId) {
+    s.execute("file.newSequence", json!({"name": "Audio", "fromItem": item.0, "video": 1, "audio": 1})).unwrap();
+}
+
+#[test]
+fn multichannel_wav_import_places_every_channel_with_one_link() {
+    use filmcraft_project::AudioChannelMap;
+    for channels in [3u16, 6, 8] {
+        let mut s = Session::default();
+        let item = import_multichannel(&mut s, channels);
+        let media = s.project.item(item).unwrap().as_media().unwrap();
+        assert_eq!(media.info.audio_streams.len(), 1);
+        assert_eq!(media.info.audio().unwrap().channels, u32::from(channels));
+        assert_eq!(media.interpret.audio_channels, Some(AudioChannelMap::for_format(AudioChannels::Mono, channels)));
+        sequence_from_audio(&mut s, item);
+        let q = s.active_sequence().unwrap();
+        assert_eq!(q.audio_tracks.len(), usize::from(channels));
+        let link = q.audio_tracks[0].items[0].link;
+        assert!(link.is_some());
+        for (k, track) in q.audio_tracks.iter().enumerate() {
+            assert_eq!(track.items.len(), 1);
+            let clip = &track.items[0];
+            assert_eq!(clip.source_channels, vec![u16::try_from(k).unwrap()]);
+            assert_eq!(clip.audio_stream, 0);
+            assert_eq!(clip.link, link);
+        }
+    }
+}
+
+#[test]
+fn multichannel_import_preferences_control_pairs_and_preserve_small_sources() {
+    use filmcraft_project::AudioChannelMap;
+    for pref in ["mono", "stereo", "asIs"] {
+        for channels in [1u16, 2, 4] {
+            let mut s = Session::default();
+            s.execute("prefs.set", json!({"key": "media.defaultAudioChannels", "value": pref})).unwrap();
+            let item = import_multichannel(&mut s, channels);
+            let want = match (channels, pref) {
+                (4, "mono") => Some(AudioChannelMap::for_format(AudioChannels::Mono, 4)),
+                (4, "stereo") => Some(AudioChannelMap::for_format(AudioChannels::Stereo, 4)),
+                _ => None,
+            };
+            assert_eq!(s.project.item(item).unwrap().as_media().unwrap().interpret.audio_channels, want);
+            sequence_from_audio(&mut s, item);
+            let tracks = &s.active_sequence().unwrap().audio_tracks;
+            let expected = want.map(|m| m.clips).unwrap_or_else(|| vec![vec![]]);
+            assert_eq!(tracks.len(), expected.len());
+            for (track, channels) in tracks.iter().zip(expected) {
+                assert_eq!(track.items.len(), 1);
+                assert_eq!(track.items[0].source_channels, channels);
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_eight_channel_clips_render_only_their_mapped_samples() {
+    let mut s = Session::default();
+    let item = import_multichannel(&mut s, 8);
+    sequence_from_audio(&mut s, item);
+    let q = s.active_sequence().unwrap();
+    let provider = s.media.provider(s.project.clone(), s.services.clone());
+    for (k, track) in q.audio_tracks.iter().enumerate() {
+        let sound = filmcraft_render::audio::track_input(&s.project, track, 0, 128, 48_000, &provider);
+        assert_eq!(sound.channels.len(), 2);
+        let want = (k + 1) as f32 / 128.0;
+        assert!(sound.channels.iter().all(|c| c.len() == 128));
+        assert!(sound.channels.iter().flatten().all(|v| (*v - want).abs() < 1e-6), "channel {k}: {:?}", sound.channels);
+    }
+}
+
+/// Audio-only OP1a, using the writer's existing multitrack PCM support.
+fn eight_mono_track_mxf() -> Vec<u8> {
+    use filmcraft_mxf::Rational;
+    use filmcraft_mxf::write::{MxfWriter, PackageIds, Pattern, SoundDesc, WriterConfig};
+    let mut cfg = WriterConfig::new(Pattern::Op1a, Rational::new(25, 1), PackageIds::from_seed("eight-mono", "Eight mono tracks"));
+    cfg.sound = vec![SoundDesc { sample_rate: 48_000, channels: 1, bits: 24 }; 8];
+    let mut writer = MxfWriter::new(std::io::Cursor::new(Vec::new()), cfg).unwrap();
+    for k in 0..8i32 {
+        let sample = ((k + 1) * 65_536).to_le_bytes();
+        let pcm: Vec<u8> = (0..1920).flat_map(|_| sample[..3].iter().copied()).collect();
+        writer.push_sound(usize::try_from(k).unwrap(), &pcm).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn mxf_mono_sound_tracks_import_as_one_stream_with_a_mono_breakout() {
+    let mut s = Session::default();
+    let item = crate::commands::import_bytes(&mut s, "/eight-mono.mxf", eight_mono_track_mxf().into(), None).unwrap();
+    let media = s.project.item(item).unwrap().as_media().unwrap();
+    assert_eq!(media.info.audio_streams.len(), 1);
+    assert_eq!(media.info.audio().unwrap().channels, 8);
+    assert_eq!(media.info.audio().unwrap().bits_per_sample, Some(24));
+    assert_eq!(media.interpret.audio_channels, Some(filmcraft_project::AudioChannelMap::for_format(AudioChannels::Mono, 8)));
+    sequence_from_audio(&mut s, item);
+    assert_eq!(s.active_sequence().unwrap().audio_tracks.len(), 8);
+}
+
+#[test]
+fn imported_mono_breakout_survives_project_save_and_open() {
+    let dir = crate::media_test_util::tmp_dir("audio-breakout-roundtrip");
+    let path = dir.join("audio.fcproj");
+    let mut s = Session::default();
+    let item = import_multichannel(&mut s, 8);
+    let want = s.project.item(item).unwrap().as_media().unwrap().interpret.audio_channels.clone();
+    s.execute("file.saveAs", json!({"path": path.to_string_lossy()})).unwrap();
+    let mut loaded = Session::default();
+    loaded.execute("file.open", json!({"path": path.to_string_lossy()})).unwrap();
+    assert_eq!(loaded.project.item(item).unwrap().as_media().unwrap().interpret.audio_channels, want);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn import_maps_only_stream_zero_and_keeps_later_stream_layouts() {
+    use filmcraft_isobmff::{Brand, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
+    let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
+    for channels in [4u16, 2] {
+        let entry = SampleEntry::pcm(PcmConfig { bits: 16, float: false, big_endian: false, signed: true, channels, sample_rate: 48_000.0 });
+        let track = mux.add_track(TrackConfig::new(entry, 48_000)).unwrap();
+        let data = vec![0u8; 4800 * usize::from(channels) * 2];
+        mux.write_sample(track, WriteSample { data: &data, duration: 4800, composition_offset: 0, is_sync: true }).unwrap();
+    }
+    let mut s = Session::default();
+    let item = crate::commands::import_bytes(&mut s, "/mapped-stream.mov", mux.finish().unwrap().into_inner().into(), None).unwrap();
+    let media = s.project.item(item).unwrap().as_media().unwrap();
+    assert_eq!(media.info.audio_streams.iter().map(|a| a.channels).collect::<Vec<_>>(), vec![4, 2]);
+    assert_eq!(media.interpret.audio_channels, Some(filmcraft_project::AudioChannelMap::for_format(AudioChannels::Mono, 4)));
+    sequence_from_audio(&mut s, item);
+    let tracks = &s.active_sequence().unwrap().audio_tracks;
+    assert_eq!(tracks.len(), 5);
+    for (k, track) in tracks.iter().enumerate() {
+        assert_eq!(track.items.len(), 1);
+        let clip = &track.items[0];
+        assert_eq!(clip.audio_stream, usize::from(k == 4));
+        assert_eq!(clip.source_channels, if k == 4 { vec![] } else { vec![u16::try_from(k).unwrap()] });
+        assert_eq!(clip.link, tracks[0].items[0].link);
+    }
+}
