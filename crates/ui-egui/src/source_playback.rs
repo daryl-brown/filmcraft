@@ -94,13 +94,23 @@ impl FilmcraftApp {
         self.source_playback.range_start = start;
         self.source_playback.item = Some(item);
         self.source_playback.shown = time;
-        self.source_playback.clock = Playback { playing: true, speed, anchor_time: -1.0, anchor_tick: time, looping, stop_at: stop, ..Default::default() };
+        self.source_playback.clock = Playback {
+            playing: true,
+            speed,
+            anchor_time: -1.0,
+            anchor_tick: time,
+            looping,
+            stop_at: stop,
+            preroll: Some(-1.0),
+            preroll_ready: false,
+            ..Default::default()
+        };
         self.source_playback.clock.meter.start(speed);
-        self.start_source_audio(0.0);
         Ok(())
     }
 
     pub fn stop_source(&mut self) {
+        self.source_playback.clock.preroll = None;
         if !self.source_playback.clock.playing {
             return;
         }
@@ -198,6 +208,29 @@ impl FilmcraftApp {
         }
     }
 
+    /// Start the Source clock and audio once the first frames are ready or the preroll timed out.
+    fn end_source_preroll(&mut self, now: f64) {
+        self.source_playback.clock.preroll = None;
+        self.source_playback.clock.anchor_time = now;
+        self.source_playback.clock.anchor_tick = self.session.state.source_playhead;
+        self.source_playback.clock.audio_seen = (0, now);
+        self.source_playback.shown = self.session.state.source_playhead;
+        self.start_source_audio(now);
+    }
+
+    /// Return whether playback is still waiting for its initial frames.
+    fn wait_for_source_preroll(&mut self, now: f64) -> bool {
+        let Some(since) = self.source_playback.clock.preroll else { return false };
+        let since = if since < 0.0 { now } else { since };
+        self.source_playback.clock.preroll = Some(since);
+        if self.source_playback.clock.preroll_ready || now - since >= crate::frames::PREROLL_TIMEOUT_S {
+            self.end_source_preroll(now);
+            false
+        } else {
+            true
+        }
+    }
+
     /// Advance Source audition playback while playing; stop on a missing or unavailable item or a failure, and re-anchor when the Source playhead is moved
     /// externally.
     pub(crate) fn advance_source_playback(&mut self, ctx: &egui::Context) {
@@ -216,6 +249,10 @@ impl FilmcraftApp {
             return;
         }
         let now = self.now();
+        if self.wait_for_source_preroll(now) {
+            ctx.request_repaint();
+            return;
+        }
         let time = self.session.state.source_playhead;
         if time != self.source_playback.shown {
             self.source_playback.clock.anchor_tick = time;
@@ -315,5 +352,124 @@ impl FilmcraftApp {
             self.stop_source();
         }
         ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FilmcraftApp;
+    use filmcraft_engine::Session;
+    use filmcraft_time::Tick;
+    use serde_json::json;
+
+    fn app() -> FilmcraftApp {
+        let mut session = Session::default();
+        session.execute("file.openDemoProject", json!({})).unwrap();
+        session.execute("source.open", json!({"item": 5})).unwrap();
+        let mut app = FilmcraftApp::new(session);
+        app.audio = None;
+        app.set_now_for_test(0.0);
+        app
+    }
+
+    fn advance(app: &mut FilmcraftApp, now: f64) {
+        app.set_now_for_test(now);
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput { time: Some(now), ..Default::default() }, |ui| app.advance_source_playback(ui.ctx()));
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn source_waits_for_readiness_or_timeout_before_starting_its_clock() {
+        for (ready, speed) in [(false, 1.0), (true, 1.0), (true, -2.0)] {
+            let mut app = app();
+            app.session.execute("source.setPlayhead", json!({"seconds": 2})).unwrap();
+            let start = app.session.state.source_playhead;
+            app.shuttle_source(speed).unwrap();
+            assert!(app.source_playback.clock.playing);
+            assert_eq!(app.source_playback.clock.preroll, Some(-1.0));
+            assert!(!app.source_playback.clock.preroll_ready);
+            assert!(!app.source_playback.clock.audio_clock);
+            assert_eq!(app.source_playback.clock.anchor_time, -1.0);
+            assert_eq!(app.session.state.source_playhead, start);
+            advance(&mut app, 1.0);
+            assert_eq!(app.source_playback.clock.preroll, Some(1.0));
+            advance(&mut app, 1.25);
+            assert_eq!(app.session.state.source_playhead, start);
+            assert_eq!(app.source_playback.clock.anchor_time, -1.0);
+            assert!(!app.source_playback.clock.audio_clock);
+            app.source_playback.clock.preroll_ready = ready;
+            let now = if ready { 1.25 } else { 1.0 + crate::frames::PREROLL_TIMEOUT_S };
+            advance(&mut app, now);
+            assert_eq!(app.source_playback.clock.preroll, None);
+            assert_eq!(app.source_playback.clock.anchor_time, now);
+            assert_eq!(app.source_playback.clock.anchor_tick, start);
+            assert_eq!(app.source_playback.clock.audio_seen, (0, now));
+            assert_eq!(app.session.state.source_playhead, start);
+            advance(&mut app, now + 0.25);
+            if speed < 0.0 {
+                assert!(app.session.state.source_playhead < start);
+            } else {
+                assert!(app.session.state.source_playhead > start);
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_or_replacing_source_playback_clears_preroll() {
+        let mut app = app();
+        app.play_source().unwrap();
+        app.stop_source();
+        assert!(!app.source_playback.clock.playing);
+        assert_eq!(app.source_playback.clock.preroll, None);
+        app.play_source().unwrap();
+        app.source_playback.clock.preroll_ready = true;
+        app.shuttle_source(-2.0).unwrap();
+        assert_eq!(app.source_playback.clock.preroll, Some(-1.0));
+        assert!(!app.source_playback.clock.preroll_ready);
+        app.session.execute("source.open", json!({"item": 6})).unwrap();
+        advance(&mut app, 1.0);
+        assert!(!app.source_playback.clock.playing);
+        assert_eq!(app.source_playback.clock.preroll, None);
+        app.play_source().unwrap();
+        *app.source_playback.failure.lock().unwrap() = Some("Source decoding failed".into());
+        advance(&mut app, 2.0);
+        assert!(!app.source_playback.clock.playing);
+        assert_eq!(app.source_playback.clock.preroll, None);
+    }
+
+    #[test]
+    fn loop_restart_keeps_the_clock_running_without_preroll() {
+        let mut app = app();
+        let (start, out) = (Tick::from_seconds_f64(1.0), Tick::from_seconds_f64(2.0));
+        app.session.execute("project.setMarks", json!({"item": 5, "in": start.0, "out": out.0})).unwrap();
+        app.source_playback.clock.looping = true;
+        app.play_source_range(false, false).unwrap();
+        let start = app.session.state.source_playhead;
+        app.end_source_preroll(0.0);
+        advance(&mut app, 3.0);
+        assert!(app.source_playback.clock.playing);
+        assert_eq!(app.source_playback.clock.preroll, None);
+        assert_eq!(app.source_playback.clock.anchor_time, 3.0);
+        assert_eq!(app.session.state.source_playhead, start);
+        advance(&mut app, 3.25);
+        assert!(app.session.state.source_playhead > start);
+    }
+
+    #[test]
+    fn external_seek_during_preroll_anchors_once_at_completion() {
+        let mut app = app();
+        app.play_source().unwrap();
+        app.session.execute("source.setPlayhead", json!({"seconds": 2})).unwrap();
+        let start = app.session.state.source_playhead;
+        advance(&mut app, 1.0);
+        assert_eq!(app.source_playback.clock.anchor_time, -1.0);
+        assert_eq!(app.session.state.source_playhead, start);
+        app.source_playback.clock.preroll_ready = true;
+        advance(&mut app, 1.25);
+        assert_eq!(app.source_playback.shown, start);
+        assert_eq!(app.source_playback.clock.anchor_tick, start);
+        advance(&mut app, 1.5);
+        assert!(app.session.state.source_playhead > start);
     }
 }

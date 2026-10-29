@@ -82,11 +82,15 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
     let key = FrameKey { target, frame, size: size_key, revision: rev, draft };
     let project = app.session.project.clone();
     if playing {
-        let preroll = which == Which::Program && app.playback.preroll.is_some();
-        let speed = if which == Which::Program { app.playback.speed } else { app.source_playback.clock.speed };
+        let clock = if which == Which::Program { &app.playback } else { &app.source_playback.clock };
+        let preroll = clock.preroll.is_some();
+        let speed = clock.speed;
         app.frames.schedule_playback(key, rate, scale, &project, speed, preroll);
         if preroll {
-            app.playback.preroll_ready = app.frames.preroll_ready(key, app.playback.speed, rate.frame_at(duration) - 1);
+            // Source time and duration are absolute media positions, including for restricted subclips.
+            let ready = app.frames.preroll_ready(key, speed, rate.frame_at(duration) - 1);
+            let clock = if which == Which::Program { &mut app.playback } else { &mut app.source_playback.clock };
+            clock.preroll_ready = ready;
         }
     } else {
         app.frames.request(key, rate.tick_of(frame), scale, &project, 0);

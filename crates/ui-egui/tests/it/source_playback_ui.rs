@@ -113,6 +113,9 @@ fn audio_source_outputs_sound_and_uses_the_device_clock() {
     let mut h = Harness::builder().with_step_dt(0.25).with_size(egui::vec2(1280.0, 800.0)).build_eframe(move |_cc| app);
     h.step();
     h.state_mut().play_source().unwrap();
+    assert!(h.state().source_playback.clock.preroll.is_some());
+    assert!(!h.state().source_playback.clock.audio_clock);
+    assert!(fill.lock().unwrap().is_none(), "Source audio must wait for preroll");
     for _ in 0..8 {
         h.step();
     }
@@ -190,7 +193,7 @@ fn a_single_frame_source_range_starts_at_the_marked_last_frame() {
     h.state_mut().session.execute("project.setMarks", json!({"item":5,"in":last.0,"out":last.0})).unwrap();
     h.state_mut().play_source_range(false, false).unwrap();
     assert_eq!(h.state().session.state.source_playhead, last);
-    for _ in 0..4 {
+    for _ in 0..8 {
         h.step();
     }
     assert!(!h.state().source_playback.clock.playing);
@@ -213,8 +216,9 @@ fn j_and_l_shuttle_the_source_both_ways_and_double_the_speed() {
     h.state_mut().session.execute("source.setPlayhead", json!({"seconds":2})).unwrap();
     assert_eq!(menus::invoke(h.state_mut(), &ctx, "playback.reverse", json!({})).unwrap()["speed"], -1.0);
     let at = h.state().session.state.source_playhead;
-    h.step();
-    h.step();
+    for _ in 0..5 {
+        h.step();
+    }
     assert!(h.state().session.state.source_playhead < at, "J plays the Source backward");
     assert!(!h.state().source_playback.clock.audio_clock, "shuttle speeds play without sound");
     assert_eq!(menus::invoke(h.state_mut(), &ctx, "playback.reverse", json!({})).unwrap()["speed"], -2.0);
