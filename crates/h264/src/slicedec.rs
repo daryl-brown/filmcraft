@@ -43,6 +43,8 @@ pub struct PicState<S: Sample> {
     rows_published: usize,
     /// Draft mode for a non-reference picture: rows are published without deblocking.
     pub skip_deblock: bool,
+    /// Reconstruct a row band without deblocking or publishing its dummy frame.
+    pub recon_only: bool,
 }
 
 impl<S: Sample> PicState<S> {
@@ -63,6 +65,7 @@ impl<S: Sample> PicState<S> {
             rows_deblocked: 0,
             rows_published: 0,
             skip_deblock: false,
+            recon_only: false,
         }
     }
 
@@ -83,6 +86,7 @@ impl<S: Sample> PicState<S> {
         self.rows_deblocked = 0;
         self.rows_published = 0;
         self.skip_deblock = false;
+        self.recon_only = false;
     }
 
     /// Record a decoded macroblock and deblock / publish rows that became final.
@@ -91,12 +95,44 @@ impl<S: Sample> PicState<S> {
         self.decoded_mbs += 1;
         let r = addr / self.mb_w;
         self.row_count[r] += 1;
+        if self.recon_only {
+            return;
+        }
         if self.row_count[r] as usize >= self.mb_w && r == self.rows_recon {
             while self.rows_recon < self.mb_h && self.row_count[self.rows_recon] as usize >= self.mb_w {
                 self.rows_recon += 1;
             }
             self.flush_rows(false);
         }
+    }
+
+    /// Adopt a reconstructed row band before the full picture is deblocked.
+    #[cfg(feature = "threads")]
+    pub fn adopt_slice(&mut self, sub: &PicState<S>, first_mb: usize, slice_num: u32) {
+        let row = first_mb / self.mb_w;
+        let y = row * 16 * self.planes.width;
+        let c = row * self.planes.mb_height_c * self.planes.cwidth;
+        if let Some(dst) = self.planes.y.get_mut(y..y + sub.planes.y.len()) {
+            dst.copy_from_slice(&sub.planes.y);
+        }
+        for (dst, src) in [(&mut self.planes.cb, &sub.planes.cb), (&mut self.planes.cr, &sub.planes.cr)] {
+            if let Some(dst) = dst.get_mut(c..c + src.len()) {
+                dst.copy_from_slice(src);
+            }
+        }
+        if let Some(dst) = self.mbs.get_mut(first_mb..first_mb + sub.mbs.len()) {
+            for (dst, src) in dst.iter_mut().zip(&sub.mbs) {
+                *dst = *src;
+                if dst.slice_num != u32::MAX {
+                    dst.slice_num = slice_num;
+                }
+            }
+        }
+        if let Some(dst) = self.row_count.get_mut(row..row + sub.row_count.len()) {
+            dst.copy_from_slice(&sub.row_count);
+        }
+        self.decoded_mbs += sub.decoded_mbs;
+        self.slices.push(sub.slices.first().cloned().unwrap_or_default());
     }
 
     /// Deblock and publish rows. With `finished`, everything remaining is processed (also rows with

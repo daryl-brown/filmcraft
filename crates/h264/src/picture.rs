@@ -224,6 +224,7 @@ impl MbKind {
 
 /// Per-macroblock state kept for the whole picture (neighbour derivations, deblocking, co-located data).
 #[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 pub struct MbState {
     /// Slice number within the picture; `u32::MAX` = not (yet) decoded.
     pub slice_num: u32,

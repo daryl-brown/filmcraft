@@ -16,7 +16,9 @@ use crate::transform::LevelScale;
 use crate::{ColorInfo, Picture};
 use filmcraft_bitstream::{BitReader, annexb_nals, length_prefixed_nals, unescape_rbsp};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(feature = "threads")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// The decoder supports at most 16 reference pictures, so constructing more
 /// inferred gap pictures cannot improve a usable reference list.
@@ -47,6 +49,8 @@ struct PendingPic {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DecodeStats {
     pub pictures: u64,
+    /// Pictures reconstructed as independent slice jobs.
+    pub slice_parallel_pictures: u64,
     pub slices_cavlc: u64,
     pub slices_cabac: u64,
     pub slices_i: u64,
@@ -78,12 +82,26 @@ struct Shared {
     /// Recycled picture buffers.
     pool: Arc<Mutex<Vec<PicState<u8>>>>,
     pool16: Arc<Mutex<Vec<PicState<u16>>>>,
+    #[cfg(feature = "threads")]
+    sub_pool: Arc<Mutex<Vec<PicState<u8>>>>,
+    #[cfg(feature = "threads")]
+    sub_pool16: Arc<Mutex<Vec<PicState<u16>>>>,
     pool_cap: usize,
 }
 
 impl Default for Shared {
     fn default() -> Self {
-        Self { error: Mutex::new(None), stats: Mutex::new(DecodeStats::default()), pool: Arc::default(), pool16: Arc::default(), pool_cap: 4 }
+        Self {
+            error: Mutex::new(None),
+            stats: Mutex::new(DecodeStats::default()),
+            pool: Arc::default(),
+            pool16: Arc::default(),
+            pool_cap: 4,
+            #[cfg(feature = "threads")]
+            sub_pool: Arc::default(),
+            #[cfg(feature = "threads")]
+            sub_pool16: Arc::default(),
+        }
     }
 }
 
@@ -91,6 +109,10 @@ impl Default for Shared {
 struct PicturePools {
     pool: Arc<Mutex<Vec<PicState<u8>>>>,
     pool16: Arc<Mutex<Vec<PicState<u16>>>>,
+    #[cfg(feature = "threads")]
+    sub_pool: Arc<Mutex<Vec<PicState<u8>>>>,
+    #[cfg(feature = "threads")]
+    sub_pool16: Arc<Mutex<Vec<PicState<u16>>>>,
 }
 
 static PICTURE_POOLS: OnceLock<PicturePools> = OnceLock::new();
@@ -120,6 +142,7 @@ pub struct Decoder {
     /// Draft mode: skip deblocking of non-reference pictures ([`Decoder::set_draft`]).
     draft: bool,
     intra_only: bool,
+    slice_parallel: bool,
 }
 
 impl Default for Decoder {
@@ -222,14 +245,34 @@ impl Decoder {
             threads: workers,
             draft: false,
             intra_only: false,
+            slice_parallel: true,
         }
+    }
+
+    /// Enable independent reconstruction of eligible intra slices (on by default).
+    pub fn set_slice_parallel(&mut self, on: bool) {
+        self.slice_parallel = on;
+    }
+
+    /// Whether independent reconstruction of eligible intra slices is enabled.
+    pub fn slice_parallel(&self) -> bool {
+        self.slice_parallel
     }
 
     /// A per-sample decoder sharing the process worker pool and recycled picture buffers.
     pub fn with_shared_pool() -> Self {
         let mut dec = Self::with_threads(1);
         let pools = PICTURE_POOLS.get_or_init(PicturePools::default);
-        dec.shared = Arc::new(Shared { pool: pools.pool.clone(), pool16: pools.pool16.clone(), pool_cap: 6, ..Shared::default() });
+        dec.shared = Arc::new(Shared {
+            pool: pools.pool.clone(),
+            pool16: pools.pool16.clone(),
+            pool_cap: 6,
+            #[cfg(feature = "threads")]
+            sub_pool: pools.sub_pool.clone(),
+            #[cfg(feature = "threads")]
+            sub_pool16: pools.sub_pool16.clone(),
+            ..Shared::default()
+        });
         dec.max_in_flight = 2;
         #[cfg(all(feature = "threads", not(target_arch = "wasm32")))]
         {
@@ -600,6 +643,13 @@ impl Decoder {
                 }
             }
             self.in_flight.push_back(frame.clone());
+            if self.slice_parallel {
+                let starts: Vec<_> = slices.iter().map(|s| (s.sh.first_mb_in_slice as usize, s.sh.slice_type == SliceType::I)).collect();
+                if let Some(ranges) = parallel_ranges(&starts, frame.mb_w, frame.mb_h()) {
+                    spawn_parallel(pool, frame, slices, ranges, shared, (draft, crop));
+                    return;
+                }
+            }
             pool.spawn_fifo(move || run_job(frame, slices, &shared, draft, crop));
             return;
         }
@@ -608,6 +658,165 @@ impl Decoder {
 
     fn emit(&mut self, outs: Vec<Output<FrameRef>>) {
         self.out_queue.extend(outs);
+    }
+}
+
+/// Whole-row intra slices can reconstruct independently of their absolute row.
+#[cfg(any(feature = "threads", test))]
+fn parallel_ranges(starts: &[(usize, bool)], mb_w: usize, mb_h: usize) -> Option<Vec<(usize, usize)>> {
+    let total = mb_w.checked_mul(mb_h)?;
+    if mb_w == 0 || starts.len() < 2 || starts.first()?.0 != 0 {
+        return None;
+    }
+    let mut ranges = Vec::with_capacity(starts.len());
+    for (k, &(first, is_i)) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).map_or(total, |s| s.0);
+        if !is_i || first >= total || !first.is_multiple_of(mb_w) || end <= first || end > total || !end.is_multiple_of(mb_w) {
+            return None;
+        }
+        ranges.push((first, (end - first) / mb_w));
+    }
+    Some(ranges)
+}
+
+#[cfg(feature = "threads")]
+enum SliceOutcome<S: Sample> {
+    // Keep result slots small while each picture owns its reconstruction buffers.
+    Done { pic: Box<PicState<S>>, error: Option<Error> },
+    Panicked,
+}
+
+#[cfg(feature = "threads")]
+struct ParJob<S: Sample> {
+    frame: FrameRef,
+    slices: Vec<SliceJob>,
+    ranges: Vec<(usize, usize)>,
+    results: Mutex<Vec<Option<SliceOutcome<S>>>>,
+    remaining: AtomicUsize,
+    draft: bool,
+    crop: (usize, usize, usize, usize),
+    pool: Arc<Mutex<Vec<PicState<S>>>>,
+    sub_pool: Arc<Mutex<Vec<PicState<S>>>>,
+    shared: Arc<Shared>,
+}
+
+#[cfg(feature = "threads")]
+fn spawn_parallel(
+    pool: &rayon::ThreadPool,
+    frame: FrameRef,
+    slices: Vec<SliceJob>,
+    ranges: Vec<(usize, usize)>,
+    shared: Arc<Shared>,
+    options: (bool, (usize, usize, usize, usize)),
+) {
+    if stores_u8(frame.bit_depth, frame.bit_depth) {
+        let pools = SlicePools { pool: shared.pool.clone(), sub_pool: shared.sub_pool.clone() };
+        ParJob::new(frame, slices, ranges, shared, options, pools).spawn(pool);
+    } else {
+        let pools = SlicePools { pool: shared.pool16.clone(), sub_pool: shared.sub_pool16.clone() };
+        ParJob::new(frame, slices, ranges, shared, options, pools).spawn(pool);
+    }
+}
+
+#[cfg(feature = "threads")]
+struct SlicePools<S: Sample> {
+    pool: Arc<Mutex<Vec<PicState<S>>>>,
+    sub_pool: Arc<Mutex<Vec<PicState<S>>>>,
+}
+
+#[cfg(feature = "threads")]
+impl<S: Sample> ParJob<S> {
+    fn new(
+        frame: FrameRef,
+        slices: Vec<SliceJob>,
+        ranges: Vec<(usize, usize)>,
+        shared: Arc<Shared>,
+        (draft, crop): (bool, (usize, usize, usize, usize)),
+        pools: SlicePools<S>,
+    ) -> Arc<Self> {
+        let count = slices.len();
+        Arc::new(Self {
+            frame,
+            slices,
+            ranges,
+            shared,
+            draft,
+            crop,
+            pool: pools.pool,
+            sub_pool: pools.sub_pool,
+            results: Mutex::new((0..count).map(|_| None).collect()),
+            remaining: AtomicUsize::new(count),
+        })
+    }
+
+    fn spawn(self: Arc<Self>, pool: &rayon::ThreadPool) {
+        for k in 0..self.slices.len() {
+            let job = self.clone();
+            pool.spawn_fifo(move || job.run_slice(k));
+        }
+    }
+
+    fn run_slice(&self, k: usize) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.reconstruct(k))).unwrap_or(SliceOutcome::Panicked);
+        {
+            let mut results = self.results.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(slot) = results.get_mut(k) {
+                *slot = Some(outcome);
+            }
+        }
+        // The mutex protects the result slots; the counter elects exactly one finisher.
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.finish();
+        }
+    }
+
+    fn reconstruct(&self, k: usize) -> SliceOutcome<S> {
+        let (Some(slice), Some(&(_, rows))) = (self.slices.get(k), self.ranges.get(k)) else {
+            return SliceOutcome::Panicked;
+        };
+        let frame = Arc::new(Frame::new(self.frame.id, self.frame.poc, self.frame.mb_w, rows, self.frame.bit_depth, self.frame.chroma_format_idc));
+        let mut pic = recycled_picture(frame, &self.sub_pool);
+        pic.recon_only = true;
+        let mut header = slice.sh.clone();
+        // Keep header_bits unchanged: the RBSP still contains the absolute address.
+        header.first_mb_in_slice = 0;
+        let error = decode_slice_header(slice, &header, &mut pic).err();
+        SliceOutcome::Done { pic: Box::new(pic), error }
+    }
+
+    fn finish(&self) {
+        let mut results = std::mem::take(&mut *self.results.lock().unwrap_or_else(PoisonError::into_inner));
+        let mut main = recycled_picture(self.frame.clone(), &self.pool);
+        main.skip_deblock = self.draft;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if results.iter().any(|r| !matches!(r, Some(SliceOutcome::Done { .. }))) {
+                return Err(());
+            }
+            let mut first_error = None;
+            for (k, (outcome, &(first_mb, _))) in results.iter_mut().zip(&self.ranges).enumerate() {
+                if let Some(SliceOutcome::Done { pic, error }) = outcome {
+                    main.adopt_slice(pic, first_mb, k as u32);
+                    if first_error.is_none() {
+                        first_error = error.take();
+                    }
+                }
+            }
+            main.flush_rows(true);
+            Ok(first_error)
+        }))
+        .unwrap_or(Err(()));
+        {
+            let mut pool = self.sub_pool.lock().unwrap_or_else(PoisonError::into_inner);
+            for outcome in results.into_iter().flatten() {
+                if let SliceOutcome::Done { pic, .. } = outcome
+                    && pool.len() < 16
+                {
+                    pool.push(*pic);
+                }
+            }
+        }
+        self.shared.stats.lock().unwrap_or_else(PoisonError::into_inner).slice_parallel_pictures += 1;
+        finish_job(self.frame.clone(), main, &self.shared, JobEnv { draft: self.draft, crop: self.crop, pool: &self.pool }, result);
     }
 }
 
@@ -628,14 +837,7 @@ struct JobEnv<'a, S: Sample> {
 
 fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared, env: JobEnv<'_, S>) {
     let JobEnv { draft, crop, pool } = env;
-    let reuse = pool.lock().ok().and_then(|mut p| p.pop());
-    let mut pic = match reuse {
-        Some(mut p) if p.mb_w == frame.mb_w && p.mb_h == frame.mb_h() && p.frame.bit_depth == frame.bit_depth && p.frame.chroma_format_idc == frame.chroma_format_idc => {
-            p.reset(frame.clone());
-            p
-        }
-        _ => PicState::new(frame.clone()),
-    };
+    let mut pic = recycled_picture(frame.clone(), pool);
     pic.skip_deblock = draft;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut first_err = None;
@@ -647,10 +849,32 @@ fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared
         pic.flush_rows(true);
         first_err
     }));
+    finish_job(frame, pic, shared, JobEnv { draft, crop, pool }, result.map_err(|_| ()));
+}
+
+/// Reuse only buffers whose sample geometry matches the new frame.
+fn recycled_picture<S: Sample>(frame: FrameRef, pool: &Mutex<Vec<PicState<S>>>) -> PicState<S> {
+    let mut available = pool.lock().unwrap_or_else(PoisonError::into_inner);
+    let index = available.iter().position(|p| {
+        p.mb_w == frame.mb_w && p.mb_h == frame.mb_h() && p.frame.bit_depth == frame.bit_depth && p.frame.chroma_format_idc == frame.chroma_format_idc
+    });
+    let reuse = index.map(|i| available.swap_remove(i));
+    drop(available);
+    match reuse {
+        Some(mut pic) => {
+            pic.reset(frame);
+            pic
+        }
+        None => PicState::new(frame),
+    }
+}
+
+/// Both job paths publish fallback rows and signal completion in the same order.
+fn finish_job<S: Sample>(frame: FrameRef, mut pic: PicState<S>, shared: &Shared, env: JobEnv<'_, S>, result: std::result::Result<Option<Error>, ()>) {
+    let JobEnv { draft, crop, pool } = env;
     let mut err = match result {
         Ok(e) => e,
-        Err(_) => {
-            // Make sure readers never block on this frame.
+        Err(()) => {
             let fallback = Planes::<S>::gray(frame.width, frame.height, frame.bit_depth, frame.chroma_format_idc);
             let blank = vec![MbState::default(); frame.mb_w * frame.mb_h()];
             for r in 0..frame.mb_h() {
@@ -697,12 +921,16 @@ fn run_job_as<S: Sample>(frame: FrameRef, slices: Vec<SliceJob>, shared: &Shared
 }
 
 fn decode_slice<S: Sample>(s: &SliceJob, pic: &mut PicState<S>) -> Result<()> {
-    let mut sd = SliceDecoder::new(&s.sh, &s.pps, &s.sps, pic, &s.refs, &s.ls)?;
+    decode_slice_header(s, &s.sh, pic)
+}
+
+fn decode_slice_header<S: Sample>(s: &SliceJob, header: &SliceHeader, pic: &mut PicState<S>) -> Result<()> {
+    let mut sd = SliceDecoder::new(header, &s.pps, &s.sps, pic, &s.refs, &s.ls)?;
     if s.pps.entropy_coding_mode {
         sd.decode_cabac(&s.rbsp)
     } else {
         let mut r = BitReader::new(&s.rbsp);
-        r.seek_bits(s.sh.header_bits);
+        r.seek_bits(header.header_bits);
         sd.decode_cavlc(&mut r)
     }
 }
@@ -769,4 +997,229 @@ fn gap_frame_as<S: Sample>(last: Option<&Frame>, id: u32, mb_w: usize, mb_h: usi
         _ => Planes::<S>::gray(mb_w * 16, mb_h * 16, bit_depth, chroma_format_idc),
     };
     Frame::from_planes(id, 0, &planes, bit_depth)
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::parallel_ranges;
+    use crate::slice::SliceType;
+    #[cfg(feature = "threads")]
+    use super::{ParJob, PendingPic, Shared, SliceOutcome, SlicePools, decode_slice, spawn_parallel};
+    #[cfg(feature = "threads")]
+    use crate::picture::{Frame, MbKind};
+    #[cfg(feature = "threads")]
+    use crate::slicedec::PicState;
+    #[cfg(feature = "threads")]
+    use crate::{Decoder, Error};
+    #[cfg(feature = "threads")]
+    use filmcraft_bitstream::annexb_nals;
+    #[cfg(feature = "threads")]
+    use std::sync::Arc;
+
+    #[test]
+    fn parallel_ranges_one_slice() {
+        assert_eq!(parallel_ranges(&[(0, true)], 4, 4), None);
+        assert_eq!(parallel_ranges(&[], 4, 4), None);
+    }
+
+    #[test]
+    fn parallel_ranges_two_row_bands() {
+        assert_eq!(parallel_ranges(&[(0, true), (8, true)], 4, 4), Some(vec![(0, 2), (8, 2)]));
+    }
+
+    #[test]
+    fn parallel_ranges_mid_row() {
+        assert_eq!(parallel_ranges(&[(0, true), (5, true)], 4, 4), None);
+    }
+
+    #[test]
+    fn parallel_ranges_out_of_order() {
+        for starts in [&[(0, true), (8, true), (4, true)][..], &[(0, true), (4, true), (4, true)]] {
+            assert_eq!(parallel_ranges(starts, 4, 4), None);
+        }
+    }
+
+    #[test]
+    fn parallel_ranges_p_slice() {
+        for kind in [SliceType::P, SliceType::B, SliceType::Sp] {
+            assert_eq!(parallel_ranges(&[(0, true), (4, kind == SliceType::I)], 4, 4), None);
+        }
+    }
+
+    #[test]
+    fn parallel_ranges_si_slice() {
+        assert_eq!(parallel_ranges(&[(0, SliceType::Si == SliceType::I), (4, true)], 4, 4), None);
+    }
+
+    #[test]
+    fn parallel_ranges_invalid_geometry() {
+        assert_eq!(parallel_ranges(&[(4, true), (8, true)], 4, 4), None);
+        assert_eq!(parallel_ranges(&[(0, true), (16, true)], 4, 4), None);
+        assert_eq!(parallel_ranges(&[(0, true), (4, true)], 0, 4), None);
+        assert_eq!(parallel_ranges(&[(0, true), (4, true)], 4, 0), None);
+        assert_eq!(parallel_ranges(&[(0, true), (4, true)], usize::MAX, 4), None);
+    }
+
+    #[cfg(feature = "threads")]
+    fn pcm_job(cabac: bool, bands: bool) -> PendingPic {
+        let mut decoder = Decoder::with_threads(1);
+        for nal in annexb_nals(&crate::synth_tests::pcm_row_bands(cabac, bands)) {
+            decoder.handle_nal(nal, 0).unwrap();
+        }
+        decoder.pending.take().unwrap()
+    }
+
+    #[test]
+    #[cfg(feature = "threads")]
+    fn adopt_slice_pcm_matches_whole_picture() {
+        let workers = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        for cabac in [false, true] {
+            let whole = pcm_job(cabac, false);
+            let mut reference = PicState::<u8>::new(whole.frame);
+            decode_slice(&whole.slices[0], &mut reference).unwrap();
+            reference.flush_rows(true);
+            // Only the slice identity changes when PCM data is split into row bands.
+            for mb in reference.mbs.iter_mut().skip(reference.mb_w) {
+                mb.slice_num = 1;
+            }
+            let bands = pcm_job(cabac, true);
+            let shared = Arc::new(Shared::default());
+            let starts: Vec<_> = bands.slices.iter().map(|s| (s.sh.first_mb_in_slice as usize, true)).collect();
+            let ranges = parallel_ranges(&starts, bands.frame.mb_w, bands.frame.mb_h()).unwrap();
+            let frame = bands.frame;
+            let crop = (0, 0, frame.width, frame.height);
+            frame.expect_output();
+            spawn_parallel(&workers, frame.clone(), bands.slices, ranges, shared.clone(), (false, crop));
+            let output = frame.take_output(crop).unwrap();
+            assert_eq!(output.0.as_u8().unwrap(), reference.planes.y.as_slice());
+            assert_eq!(output.1.as_u8().unwrap(), reference.planes.cb.as_slice());
+            assert_eq!(output.2.as_u8().unwrap(), reference.planes.cr.as_slice());
+            let main = shared.pool.lock().unwrap().pop().unwrap();
+            assert_eq!(main.planes.y, reference.planes.y);
+            assert_eq!(main.planes.cb, reference.planes.cb);
+            assert_eq!(main.planes.cr, reference.planes.cr);
+            assert_eq!(main.mbs, reference.mbs);
+            assert_eq!(main.decoded_mbs, reference.decoded_mbs);
+            assert_eq!(main.slices.len(), 2);
+            assert_eq!(shared.sub_pool.lock().unwrap().len(), 2);
+            assert_eq!(shared.stats.lock().unwrap().slice_parallel_pictures, 1);
+        }
+    }
+
+    #[cfg(feature = "threads")]
+    fn band_job() -> Arc<ParJob<u8>> {
+        let bands = pcm_job(false, true);
+        let starts: Vec<_> = bands.slices.iter().map(|s| (s.sh.first_mb_in_slice as usize, true)).collect();
+        let ranges = parallel_ranges(&starts, bands.frame.mb_w, bands.frame.mb_h()).unwrap();
+        let crop = (0, 0, bands.frame.width, bands.frame.height);
+        bands.frame.expect_output();
+        let shared = Arc::new(Shared::default());
+        let pools = SlicePools { pool: shared.pool.clone(), sub_pool: shared.sub_pool.clone() };
+        ParJob::new(bands.frame, bands.slices, ranges, shared, (false, crop), pools)
+    }
+
+    #[test]
+    #[cfg(feature = "threads")]
+    fn parallel_slice_panic_publishes_fallback_and_finishes() {
+        let job = band_job();
+        // A damaged recycled buffer forces an actual unwind in PCM reconstruction.
+        let frame = Arc::new(Frame::new(1, 0, job.frame.mb_w, 1, 8, 1));
+        let mut damaged = PicState::new(frame);
+        damaged.planes.y.clear();
+        job.sub_pool.lock().unwrap().push(damaged);
+        job.run_slice(0);
+        assert!(!job.frame.is_ready());
+        assert!(matches!(job.results.lock().unwrap()[0], Some(SliceOutcome::Panicked)));
+        job.run_slice(1);
+        assert!(job.frame.is_ready());
+        let (y, u, v) = job.frame.take_output(job.crop).unwrap();
+        for plane in [y, u, v] {
+            assert!(plane.to_le_bytes().iter().all(|&v| v == 128));
+        }
+        assert_eq!(job.shared.error.lock().unwrap().as_ref(), Some(&Error::Invalid("internal error while decoding a picture".into())));
+        assert_eq!(job.shared.stats.lock().unwrap().pictures, 1);
+        assert_eq!(job.shared.stats.lock().unwrap().slice_parallel_pictures, 1);
+    }
+
+    #[test]
+    #[cfg(feature = "threads")]
+    fn parallel_errors_follow_slice_order() {
+        let mut job = band_job();
+        let state = Arc::get_mut(&mut job).unwrap();
+        // Distinct decoding errors, with the higher numbered slice finishing first.
+        state.slices[0].sh.header_bits = 0;
+        state.slices[0].rbsp.clear();
+        state.slices[1].sh.header_bits = 0;
+        state.slices[1].sh.slice_type = SliceType::P;
+        state.slices[1].rbsp = vec![0x08, 0]; // mb_skip_run = 15, beyond the band
+        let expected = match state.reconstruct(0) {
+            SliceOutcome::Done { error: Some(error), .. } => error,
+            _ => panic!("expected a decoding error"),
+        };
+        let later = match state.reconstruct(1) {
+            SliceOutcome::Done { error: Some(error), .. } => error,
+            _ => panic!("expected a second decoding error"),
+        };
+        assert_ne!(expected, later);
+        job.run_slice(1);
+        assert!(!job.frame.is_ready());
+        job.run_slice(0);
+        assert!(job.frame.is_ready());
+        assert_eq!(job.shared.error.lock().unwrap().as_ref(), Some(&expected));
+        assert!(job.frame.take_output(job.crop).is_some());
+        assert_eq!(job.sub_pool.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "threads")]
+    fn parallel_assembly_panic_publishes_fallback_and_finishes() {
+        let job = band_job();
+        for k in 0..2 {
+            job.results.lock().unwrap()[k] = Some(job.reconstruct(k));
+        }
+        // A damaged recycled destination forces an actual unwind in deblocking.
+        let mut main = PicState::new(job.frame.clone());
+        main.mbs.clear();
+        job.pool.lock().unwrap().push(main);
+        job.finish();
+        assert!(job.frame.is_ready());
+        assert_eq!(job.shared.error.lock().unwrap().as_ref(), Some(&Error::Invalid("internal error while decoding a picture".into())));
+        assert!(job.frame.take_output(job.crop).is_some());
+        assert_eq!(job.sub_pool.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[cfg(feature = "threads")]
+    fn parallel_draft_skips_whole_picture_deblocking() {
+        let mut outputs = Vec::new();
+        for draft in [false, true] {
+            let mut job = band_job();
+            Arc::get_mut(&mut job).unwrap().draft = draft;
+            for k in 0..2 {
+                let mut outcome = job.reconstruct(k);
+                if let SliceOutcome::Done { pic, error } = &mut outcome {
+                    assert!(error.is_none());
+                    let pic = pic.as_mut();
+                    for mb in &mut pic.mbs {
+                        mb.kind = MbKind::I16x16;
+                        mb.qp = 40;
+                        mb.qpc = [37; 2];
+                    }
+                    for plane in [&mut pic.planes.y, &mut pic.planes.cb, &mut pic.planes.cr] {
+                        plane.fill(100 + k as u8 * 3);
+                    }
+                }
+                job.results.lock().unwrap()[k] = Some(outcome);
+            }
+            job.finish();
+            assert!(job.frame.is_ready());
+            assert!(job.shared.error.lock().unwrap().is_none());
+            let main = job.pool.lock().unwrap().pop().unwrap();
+            assert_eq!(main.skip_deblock, draft);
+            outputs.push(job.frame.take_output(job.crop).unwrap());
+        }
+        assert_ne!(outputs[0], outputs[1]);
+        let expected: Vec<u8> = (0..4 * 16 * 3 * 16).map(|i| if i < 4 * 16 * 16 { 100 } else { 103 }).collect();
+        assert_eq!(outputs[1].0.as_u8().unwrap(), expected.as_slice());
+    }
 }

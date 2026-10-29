@@ -119,7 +119,11 @@ fn slice_header(w: &mut BitWriter, p: &Pic, cabac: bool) {
 }
 
 fn slice_header_qp(w: &mut BitWriter, p: &Pic, cabac: bool, qp_delta: i32) {
-    w.write_ue(0); // first_mb
+    slice_header_at(w, p, cabac, qp_delta, 0);
+}
+
+fn slice_header_at(w: &mut BitWriter, p: &Pic, cabac: bool, qp_delta: i32, first_mb: u32) {
+    w.write_ue(first_mb);
     w.write_ue(if p.b {
         6
     } else if p.is_p() {
@@ -283,8 +287,12 @@ fn write_pcm(w: &mut BitWriter, samples: &[u8]) {
 }
 
 fn slice_nal(p: &Pic, cabac: bool) -> Vec<u8> {
+    slice_nal_at(p, cabac, 0)
+}
+
+fn slice_nal_at(p: &Pic, cabac: bool, first_mb: u32) -> Vec<u8> {
     let mut w = BitWriter::new();
-    slice_header(&mut w, p, cabac);
+    slice_header_at(&mut w, p, cabac, 0, first_mb);
     if !cabac && p.b {
         w.write_ue(NMB as u32);
         w.rbsp_trailing();
@@ -336,12 +344,31 @@ fn slice_nal(p: &Pic, cabac: bool) -> Vec<u8> {
                 write_pcm(&mut w, s);
                 e.init();
             }
-            e.terminate(&mut w, i + 1 == NMB); // end_of_slice_flag
+            e.terminate(&mut w, i + 1 == p.mbs.len()); // end_of_slice_flag
         }
         w.align_zero();
     }
     let t = if p.idr { 5 } else { 1 };
     nal(p.ref_idc, t, &w.finish())
+}
+
+/// The same PCM samples encoded as one slice or two complete row bands.
+#[cfg(feature = "threads")]
+pub(super) fn pcm_row_bands(cabac: bool, bands: bool) -> Vec<u8> {
+    let mut seed = 731u32;
+    let mbs = (0..NMB).map(|_| Some(random_mb(&mut seed))).collect();
+    let p = Pic { idr: true, ref_idc: 3, mbs, ..Default::default() };
+    let mut stream = sps(if cabac { 77 } else { 66 }, 2, false, PocType::T2);
+    stream.extend(pps(cabac, false));
+    if bands {
+        for (first, end) in [(0, MB_W), (MB_W, NMB)] {
+            let band = Pic { mbs: p.mbs[first..end].to_vec(), ..p.clone() };
+            stream.extend(slice_nal_at(&band, cabac, first as u32));
+        }
+    } else {
+        stream.extend(slice_nal(&p, cabac));
+    }
+    stream
 }
 
 fn random_mb(seed: &mut u32) -> Vec<u8> {
