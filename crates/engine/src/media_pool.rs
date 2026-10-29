@@ -59,6 +59,7 @@ pub struct MediaPool {
     /// Media and proxy paths that came from a document, with that document's path (see
     /// [`Self::follow`]).
     stored: RwLock<HashMap<String, Option<PathBuf>>>,
+    stash: Mutex<HashMap<String, (web_time::Instant, SharedSource)>>,
 }
 
 impl Default for MediaPool {
@@ -72,9 +73,13 @@ impl Default for MediaPool {
             failures: Arc::default(),
             openers: RwLock::new(filmcraft_codecs::openers()),
             stored: RwLock::default(),
+            stash: Mutex::default(),
         }
     }
 }
+
+/// Maximum lifetime of a prefetched relink candidate.
+pub const STASH_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Largest file [`MediaPool::probe_file`] reads whole when no streaming reader takes it (WAV,
 /// MP3 and other byte-opened formats, or an unsupported container).
@@ -146,6 +151,40 @@ fn file_name(path: &str) -> String {
 }
 
 impl MediaPool {
+    /// Keep a recently opened candidate until the session commits its relink.
+    pub fn stash_source(&self, path: &str, source: SharedSource) {
+        self.stash_source_at(path, source, web_time::Instant::now());
+    }
+
+    fn stash_source_at(&self, path: &str, source: SharedSource, now: web_time::Instant) {
+        let mut stash = self.stash.lock().unwrap_or_else(PoisonError::into_inner);
+        stash.retain(|_, (time, _)| now.saturating_duration_since(*time) < STASH_TTL);
+        stash.insert(path.to_string(), (now, source));
+        if stash.len() > 256
+            && let Some(oldest) = stash.iter().min_by_key(|(_, (time, _))| *time).map(|(path, _)| path.clone())
+        {
+            stash.remove(&oldest);
+        }
+    }
+
+    #[cfg(any(test, not(target_arch = "wasm32")))]
+    pub(crate) fn is_stashed(&self, path: &str) -> bool {
+        let now = web_time::Instant::now();
+        let mut stash = self.stash.lock().unwrap_or_else(PoisonError::into_inner);
+        stash.retain(|_, (time, _)| now.saturating_duration_since(*time) < STASH_TTL);
+        stash.contains_key(path)
+    }
+
+    fn take_stashed(&self, path: &str) -> Option<SharedSource> {
+        self.take_stashed_at(path, web_time::Instant::now())
+    }
+
+    fn take_stashed_at(&self, path: &str, now: web_time::Instant) -> Option<SharedSource> {
+        let mut stash = self.stash.lock().unwrap_or_else(PoisonError::into_inner);
+        stash.retain(|_, (time, _)| now.saturating_duration_since(*time) < STASH_TTL);
+        stash.remove(path).map(|(_, source)| source)
+    }
+
     pub fn register_opener(&self, o: Opener) {
         self.openers.write().unwrap_or_else(PoisonError::into_inner).push(o);
     }
@@ -279,6 +318,9 @@ impl MediaPool {
     /// Read and open a file through `services` (through its random-access reader when the host
     /// has one: containers then read only their index now and samples on demand).
     pub fn open_file(&self, path: &str, services: &dyn Services) -> Result<SharedSource, MediaError> {
+        if let Some(source) = self.take_stashed(path) {
+            return Ok(source);
+        }
         let _scope = crate::watchdog::scope("media.open", path);
         let io = |e: std::io::Error| if e.kind() == std::io::ErrorKind::NotFound { MediaError::Offline(e.to_string()) } else { MediaError::Io(e.to_string()) };
         if let Some(r) = services.reader(path) {
@@ -647,6 +689,33 @@ impl MediaSource for ProxySource {
 mod tests {
     use super::*;
     use filmcraft_project::ItemKind;
+
+    #[test]
+    fn stash_is_single_use_expires_and_is_bounded() {
+        let pool = MediaPool::default();
+        let source: SharedSource = Arc::new(GeneratorSource::new(
+            filmcraft_media::Generator::ColorMatte { color: [0.0; 4] }, 16, 8, Default::default(), filmcraft_time::Tick(100),
+        ));
+        let fs = crate::media_browser_tests::FakeFs::default();
+        pool.stash_source("/candidate.wav", source.clone());
+        assert!(Arc::ptr_eq(&pool.open_file("/candidate.wav", &fs).unwrap(), &source));
+        assert!(pool.open_file("/candidate.wav", &fs).is_err());
+        let now = web_time::Instant::now();
+        pool.stash.lock().unwrap().insert("expired".into(), (now, source.clone()));
+        assert!(pool.take_stashed_at("expired", now + super::STASH_TTL).is_none());
+        assert!(pool.stash.lock().unwrap().is_empty());
+        for n in 0..256 {
+            pool.stash_source_at(&format!("candidate{n}"), source.clone(), now + std::time::Duration::from_millis(1));
+        }
+        assert_eq!(pool.stash.lock().unwrap().len(), 256);
+        assert!(pool.take_stashed("candidate0").is_some());
+        // Give one entry a strictly earlier insertion time without waiting for the clock.
+        pool.stash.lock().unwrap().insert("oldest".into(), (now, source.clone()));
+        pool.stash_source_at("newest", source, now + std::time::Duration::from_millis(2));
+        assert_eq!(pool.stash.lock().unwrap().len(), 256);
+        assert!(!pool.is_stashed("oldest"));
+        assert!(pool.is_stashed("newest"));
+    }
 
     /// A host whose whole-file read fails: opening must go through the reader.
     struct ReaderOnly(Arc<[u8]>);

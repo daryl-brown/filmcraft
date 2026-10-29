@@ -88,6 +88,7 @@ mod native {
         maximum: usize,
         entered: usize,
         released: bool,
+        opens: std::collections::BTreeMap<String, usize>,
     }
 
     struct PoolFs {
@@ -111,10 +112,17 @@ mod native {
     }
 
     impl Services for PoolFs {
+        fn read_range(&self, path: &str, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
+            let bytes = self.fs.read_file(path)?;
+            let start = usize::try_from(offset).unwrap().min(bytes.len());
+            Ok(bytes[start..start.saturating_add(len).min(bytes.len())].to_vec())
+        }
+
         fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
             let mut state = self.state.lock().unwrap();
             state.active += 1;
             state.entered += 1;
+            *state.opens.entry(path.to_string()).or_default() += 1;
             state.maximum = state.maximum.max(state.active);
             if self.threshold > 0 && state.active >= self.threshold {
                 state.released = true;
@@ -153,6 +161,197 @@ mod native {
         }
         let fs = Arc::new(PoolFs { fs, state: Mutex::new(OpenState::default()), changed: Condvar::new(), threshold });
         (Session::new(fs.clone()), fs, paths)
+    }
+
+    fn missing_pool(count: usize) -> (Session, Arc<PoolFs>, Vec<String>, Vec<ItemId>) {
+        let (mut s, fs, paths) = pool_fixture(count, 0);
+        fs.release();
+        let imported = s.execute("file.import", json!({"paths": paths})).unwrap();
+        let items: Vec<ItemId> = imported["items"].as_array().unwrap().iter().map(|id| ItemId(id.as_u64().unwrap())).collect();
+        s.edit("Move media", |project, _| {
+            for (item, path) in items.iter().zip(&paths) {
+                project.item_mut(*item).unwrap().as_media_mut().unwrap().media = MediaRef::File { path: format!("/missing{path}") };
+            }
+            Ok(())
+        }).unwrap();
+        crate::relink::refresh(&mut s);
+        *fs.state.lock().unwrap() = OpenState::default();
+        (s, fs, paths, items)
+    }
+
+    #[test]
+    fn background_relink_defers_commit_matches_sync_and_opens_once() {
+        for threads in [1, 3] {
+            let (mut s, fs, paths, items) = missing_pool(6);
+            let (mut sync, sync_fs, _, _) = missing_pool(6);
+            sync_fs.release();
+            let params = json!({"item": items[0].0, "path": paths[0]});
+            let expected = sync.execute("media.relink", params.clone()).unwrap();
+            assert!(expected.get("pending").is_none());
+            let mut params = params;
+            params["background"] = json!(true);
+            params["openThreads"] = json!(threads);
+            let began = Instant::now();
+            let out = s.execute("media.relink", params).unwrap();
+            assert!(began.elapsed() < Duration::from_secs(5));
+            assert_eq!(out["pending"], true);
+            assert_eq!(out["files"], 6);
+            fs.wait_for(threads);
+            assert_eq!(s.offline.missing, items);
+            for (item, path) in items.iter().zip(&paths) {
+                assert_eq!(s.project.item(*item).unwrap().as_media().unwrap().media, MediaRef::File { path: format!("/missing{path}") });
+            }
+            fs.release();
+            let done = wait(&mut s, out["job"].as_u64().unwrap());
+            assert_eq!(done["commands"][0]["command"], "media.relink");
+            assert_eq!(done["commands"][0]["result"]["Ok"], expected);
+            assert!(done["outcomes"].as_array().unwrap().is_empty());
+            assert!(s.offline.missing.is_empty());
+            let state = fs.state.lock().unwrap();
+            assert_eq!(state.entered, paths.len());
+            assert_eq!(state.opens.len(), paths.len());
+            assert!(state.opens.values().all(|count| *count == 1));
+            assert_eq!(state.maximum, threads);
+        }
+    }
+
+    #[test]
+    fn cancelled_relink_never_commits_and_stops_the_queue() {
+        let (mut s, fs, paths, items) = missing_pool(6);
+        let out = s.execute("media.relink", json!({"item": items[0].0, "path": paths[0], "background": true, "openThreads": 2})).unwrap();
+        let job = out["job"].as_u64().unwrap();
+        fs.wait_for(2);
+        s.execute("file.importStatus", json!({"job": job, "cancel": true})).unwrap();
+        fs.release();
+        let done = wait(&mut s, job);
+        assert_eq!(done["commands"][0]["result"]["Err"], "cancelled");
+        assert_eq!(s.offline.missing, items);
+        assert_eq!(fs.state.lock().unwrap().entered, 2);
+    }
+
+    #[test]
+    fn background_prefix_relink_matches_sync_and_waits_without_selected_job() {
+        let (mut s, fs, _, _) = missing_pool(4);
+        let (mut sync, sync_fs, _, _) = missing_pool(4);
+        sync_fs.release();
+        let expected = sync.execute("media.autoRelink", json!({"from": "/missing", "to": ""})).unwrap();
+        assert!(expected.get("job").is_none());
+        let out = s.execute("media.autoRelink", json!({"from": "/missing", "to": "", "background": true, "openThreads": 2})).unwrap();
+        assert_eq!(out["files"], 4);
+        fs.wait_for(2);
+        assert_eq!(s.offline.missing.len(), 4);
+        fs.release();
+        let done = s.execute("file.importStatus", json!({"wait": true, "timeoutMs": 30_000})).unwrap();
+        assert_eq!(done["pending"], 0);
+        assert_eq!(done["commands"][0]["result"]["Ok"], expected);
+        assert_eq!(fs.state.lock().unwrap().entered, 4);
+    }
+
+    #[test]
+    fn deferred_relink_revalidates_item_after_project_edit() {
+        let (mut s, fs, paths, items) = missing_pool(2);
+        let params = json!({"item": items[0].0, "path": paths[0], "background": true, "openThreads": 1});
+        let out = s.execute("media.relink", params).unwrap();
+        fs.wait_for(1);
+        s.edit("Delete media", |project, _| {
+            project.items.remove(&items[0]);
+            project.root.remove_item(items[0]);
+            Ok(())
+        }).unwrap();
+        let expected = s.execute("media.relink", json!({"item": items[0].0, "path": paths[0]})).unwrap_err().to_string();
+        fs.release();
+        let done = wait(&mut s, out["job"].as_u64().unwrap());
+        assert_eq!(done["commands"][0]["result"]["Err"], expected);
+    }
+
+    fn folder_relink_pool(root: &std::path::Path) -> (Session, Arc<PoolFs>) {
+        let (s, fs, paths, _) = missing_pool(3);
+        let mut files = fs.fs.files.lock().unwrap();
+        for (index, path) in paths.iter().enumerate() {
+            let mut bytes = files.remove(path).unwrap();
+            if index == 2 {
+                bytes.push(0);
+            }
+            files.insert(root.join(format!("file{index}.wav")).to_string_lossy().into_owned(), bytes);
+        }
+        drop(files);
+        (s, fs)
+    }
+
+    #[test]
+    fn background_folder_relink_matches_sync_and_skips_size_mismatch() {
+        let root = crate::media_test_util::tmp_dir("background-folder-relink");
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..3 {
+            std::fs::write(root.join(format!("file{index}.wav")), []).unwrap();
+        }
+        let (mut s, fs) = folder_relink_pool(&root);
+        let (mut sync, sync_fs) = folder_relink_pool(&root);
+        sync_fs.release();
+        let expected = sync.execute("media.autoRelink", json!({"folder": root.to_string_lossy()})).unwrap();
+        assert!(expected.get("job").is_none());
+        assert_eq!(expected["relinked"].as_array().unwrap().len(), 2);
+        assert_eq!(expected["failed"].as_array().unwrap().len(), 1);
+        let out = s.execute("media.autoRelink", json!({"folder": root.to_string_lossy(), "background": true, "openThreads": 2})).unwrap();
+        assert_eq!(out["files"], 2);
+        fs.wait_for(2);
+        assert_eq!(s.offline.missing.len(), 3);
+        fs.release();
+        let done = wait(&mut s, out["job"].as_u64().unwrap());
+        assert_eq!(done["commands"][0]["result"]["Ok"], expected);
+        assert_eq!(fs.state.lock().unwrap().entered, 2);
+        assert_eq!(s.offline.missing.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stashed_candidates_and_empty_remaps_commit_immediately() {
+        let (mut s, fs, paths, items) = missing_pool(2);
+        fs.release();
+        for path in &paths {
+            let source = s.media.open_file(path, &*fs).unwrap();
+            s.media.stash_source(path, source);
+        }
+        let out = s.execute("media.relink", json!({"item": items[0].0, "path": paths[0], "background": true})).unwrap();
+        assert!(out.get("job").is_none());
+        assert_eq!(out["relinked"].as_array().unwrap().len(), 2);
+        assert!(s.jobs.is_empty());
+        let out = s.execute("media.autoRelink", json!({"from": "/unused", "to": "/elsewhere", "background": true})).unwrap();
+        assert!(out.get("pending").is_none());
+        assert_eq!(out["relinked"], json!([]));
+    }
+
+    #[test]
+    fn selected_command_outcomes_leave_other_consumers_results_available() {
+        let mut s = Session::default();
+        for job in [1, 2, 3] {
+            s.command_results.push(crate::import_jobs::CommandOutcome {
+                job, command: "media.relink".into(), result: Ok(json!({"relinked": []})),
+            });
+        }
+        let selected = s.execute("file.importStatus", json!({"job": 2})).unwrap();
+        assert_eq!(selected["commands"].as_array().unwrap().len(), 1);
+        assert_eq!(selected["commands"][0]["job"], 2);
+        assert_eq!(s.take_command_outcome(1).unwrap().job, 1);
+        assert_eq!(s.take_command_outcomes().iter().map(|outcome| outcome.job).collect::<Vec<_>>(), vec![3]);
+        assert!(s.take_command_outcomes().is_empty());
+    }
+
+    #[test]
+    fn background_relink_validates_parameters_before_starting_a_job() {
+        let mut s = Session::default();
+        for (command, params) in [
+            ("media.relink", json!({})),
+            ("media.relink", json!({"item": 1})),
+            ("media.relink", json!({"item": 1, "path": "/candidate.wav"})),
+            ("media.autoRelink", json!({"from": "/old"})),
+        ] {
+            let expected = s.execute(command, params.clone()).unwrap_err().to_string();
+            let mut params = params;
+            params["background"] = json!(true);
+            assert_eq!(s.execute(command, params).unwrap_err().to_string(), expected);
+            assert!(s.jobs.is_empty());
+        }
     }
 
     #[test]
@@ -790,4 +989,23 @@ fn wasm_background_project_media_is_a_no_op() {
     assert_eq!(out, serde_json::json!({"job": null, "pending": false, "files": 0, "skipped": 0}));
     s.request_open(filmcraft_project::ItemId(1));
     assert!(s.jobs.is_empty());
+}
+
+#[cfg(target_arch = "wasm32")]
+#[test]
+fn wasm_relink_background_parameters_retain_synchronous_results() {
+    let mut s = crate::Session::new(std::sync::Arc::new(crate::media_browser_tests::folder_fixture()));
+    let imported = s.execute("file.import", serde_json::json!({"paths": ["/outside.wav"]})).unwrap();
+    for (command, params) in [
+        ("media.relink", serde_json::json!({"item": imported["items"][0], "path": "/outside.wav"})),
+        ("media.autoRelink", serde_json::json!({"from": "/missing", "to": "/"})),
+        ("media.autoRelink", serde_json::json!({"folder": "/missing"})),
+    ] {
+        let expected = s.execute(command, params.clone()).unwrap();
+        let mut params = params;
+        params["background"] = serde_json::json!(true);
+        params["openThreads"] = serde_json::json!(4);
+        assert_eq!(s.execute(command, params).unwrap(), expected);
+        assert!(s.jobs.is_empty());
+    }
 }

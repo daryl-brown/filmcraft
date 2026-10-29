@@ -488,6 +488,7 @@ pub struct Session {
     pub(crate) open_workers: Vec<media_open::PendingOpen>,
     pub(crate) opening_times: std::collections::HashMap<ItemId, web_time::Instant>,
     pub import_results: Vec<import_jobs::ImportOutcome>,
+    pub command_results: Vec<import_jobs::CommandOutcome>,
     /// Effect presets (built-in + the user's, persisted in the data directory).
     pub presets: presets::PresetLibrary,
     /// Export presets (built-in + the user's, persisted in the data directory) and favourites.
@@ -598,6 +599,7 @@ impl Session {
             open_workers: Default::default(),
             opening_times: Default::default(),
             import_results: Vec::new(),
+            command_results: Vec::new(),
             presets: Default::default(),
             export_presets: Default::default(),
             export_queue: Default::default(),
@@ -690,6 +692,17 @@ impl Session {
     /// Drain committed imports once. Outcomes drained by `file.importStatus` are no longer available here.
     pub fn take_import_outcomes(&mut self) -> Vec<import_jobs::ImportOutcome> {
         std::mem::take(&mut self.import_results)
+    }
+
+    /// Drain deferred command outcomes once.
+    pub fn take_command_outcomes(&mut self) -> Vec<import_jobs::CommandOutcome> {
+        std::mem::take(&mut self.command_results)
+    }
+
+    /// Drain only the selected job, leaving other consumers' outcomes available.
+    pub fn take_command_outcome(&mut self, job: u64) -> Option<import_jobs::CommandOutcome> {
+        let index = self.command_results.iter().position(|outcome| outcome.job == job)?;
+        Some(self.command_results.remove(index))
     }
 
     /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the

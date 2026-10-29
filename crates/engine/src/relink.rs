@@ -368,6 +368,67 @@ fn apply(s: &mut Session, plans: Vec<Plan>, align_timecode: bool, label: &str) -
     Ok(rows)
 }
 
+fn other_paths(m: &Missing, remap: Option<&(String, String)>, new_dir: Option<&Path>) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some((from, to)) = remap
+        && let Some(path) = apply_remap(&m.path, from, to)
+    {
+        paths.push(path);
+    }
+    if let Some(dir) = new_dir {
+        paths.push(dir.join(&m.file_name).to_string_lossy().into_owned());
+    }
+    paths
+}
+
+fn remapped_path(m: &Missing, from: &str, to: &str) -> Option<String> {
+    apply_remap(&m.path, from, to)
+}
+
+fn named_candidates<'a>(m: &Missing, index: &'a BTreeMap<String, Vec<PathBuf>>) -> impl Iterator<Item = &'a PathBuf> {
+    index.get(&m.file_name.to_ascii_lowercase()).into_iter().flatten()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn folder_prefetch(s: &Session, missing: &[Missing], folder: &str) -> Vec<String> {
+    let index = index_folder(Path::new(folder), 20_000);
+    let mut paths = Vec::new();
+    for m in missing {
+        let identity = s.project.item(ItemId(m.item)).and_then(|i| i.as_media()).and_then(|m| m.identity);
+        for path in named_candidates(m, &index) {
+            let path = path.to_string_lossy().into_owned();
+            if identity.is_none_or(|id| s.services.file_size(&path).is_ok_and(|size| id.size == size)) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn relink_prefetch(s: &Session, item: ItemId, old: &str, new: &str, options: &MatchOptions) -> Vec<String> {
+    let mut paths = vec![new.to_string()];
+    if options.relink_others {
+        let remap = derive_remap(old, new);
+        let dir = Path::new(new).parent();
+        for m in scan(&s.project, &s.media, &*s.services).into_iter().filter(|m| m.item != item.0 && m.status == "missing") {
+            paths.extend(other_paths(&m, remap.as_ref(), dir).into_iter().filter(|path| s.services.file_size(path).is_ok()));
+        }
+    }
+    paths
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn auto_prefetch(s: &Session, p: &Value, missing: &[Missing]) -> Result<Vec<String>> {
+    if let (Some(from), Some(to)) = (str_p(p, "from"), str_p(p, "to")) {
+        Ok(missing.iter().filter_map(|m| remapped_path(m, from, to)).collect())
+    } else if let Some(folder) = str_p(p, "folder") {
+        Ok(folder_prefetch(s, missing, folder))
+    } else {
+        Err(bad("media.autoRelink", "need `from` and `to`, or `folder`"))
+    }
+}
+
 /// Other missing items that the remap (or the new file's folder) finds, checked.
 fn others(s: &Session, skip: ItemId, old: &str, new: &str, o: &MatchOptions) -> Vec<Plan> {
     let remap = derive_remap(old, new);
@@ -378,19 +439,7 @@ fn others(s: &Session, skip: ItemId, old: &str, new: &str, o: &MatchOptions) -> 
         if id == skip || m.status != "missing" {
             continue;
         }
-        let mut tries = Vec::new();
-        if let Some((f, t)) = &remap
-            && let Some(p) = apply_remap(&m.path, f, t)
-        {
-            tries.push(p);
-        }
-        if let Some(d) = &new_dir {
-            tries.push(d.join(&m.file_name).to_string_lossy().into_owned());
-        }
-        for p in tries {
-            if s.services.file_size(&p).is_err() {
-                continue;
-            }
+        for p in other_paths(&m, remap.as_ref(), new_dir.as_deref()).into_iter().filter(|p| s.services.file_size(p).is_ok()) {
             if let Ok(c) = check_candidate(s, id, &p, o)
                 && c.ok
             {
@@ -412,6 +461,11 @@ pub fn relink(s: &mut Session, p: &Value) -> Result<Value> {
         Some(MediaRef::File { path }) => path,
         _ => return Err(bad("media.relink", format!("item {} is not file media", item.0))),
     };
+    #[cfg(not(target_arch = "wasm32"))]
+    if bool_p(p, "background").unwrap_or(false) {
+        let paths = relink_prefetch(s, item, &old, &path, &o);
+        return crate::import_jobs::defer(s, "media.relink", p, paths);
+    }
     let mut c = check_candidate(s, item, &path, &o)?;
     if !c.ok && !force {
         return Err(EngineError::Other(format!("{} doesn't match {}: {}", file_name(&path), file_name(&old), c.problems.join("; "))));
@@ -437,11 +491,16 @@ pub fn relink(s: &mut Session, p: &Value) -> Result<Value> {
 pub fn auto_relink(s: &mut Session, p: &Value) -> Result<Value> {
     let o = MatchOptions::from_params(p);
     let missing: Vec<Missing> = scan(&s.project, &s.media, &*s.services).into_iter().filter(|m| m.status == "missing").collect();
+    #[cfg(not(target_arch = "wasm32"))]
+    if bool_p(p, "background").unwrap_or(false) {
+        let paths = auto_prefetch(s, p, &missing)?;
+        return crate::import_jobs::defer(s, "media.autoRelink", p, paths);
+    }
     let mut plans = Vec::new();
     let mut failed = Vec::new();
     if let (Some(from), Some(to)) = (str_p(p, "from"), str_p(p, "to")) {
         for m in &missing {
-            let Some(np) = apply_remap(&m.path, from, to) else { continue };
+            let Some(np) = remapped_path(m, from, to) else { continue };
             match check_candidate(s, ItemId(m.item), &np, &o) {
                 Ok(c) if c.ok => plans.push(Plan { item: ItemId(m.item), cand: c }),
                 Ok(c) => failed.push(json!({"item": m.item, "path": np, "problems": c.problems})),
@@ -451,9 +510,8 @@ pub fn auto_relink(s: &mut Session, p: &Value) -> Result<Value> {
     } else if let Some(folder) = str_p(p, "folder") {
         let index = index_folder(Path::new(folder), 20_000);
         for m in &missing {
-            let key = m.file_name.to_ascii_lowercase();
             let mut best: Option<Candidate> = None;
-            for cand in index.get(&key).into_iter().flatten() {
+            for cand in named_candidates(m, &index) {
                 if let Ok(c) = check_candidate(s, ItemId(m.item), &cand.to_string_lossy(), &o)
                     && c.ok
                     && best.as_ref().is_none_or(|b| c.score > b.score)
@@ -662,7 +720,7 @@ pub fn commands() -> Vec<CommandSpec> {
             label: "Relink Media",
             menu: &[],
             shortcut: None,
-            params: r#"{"item":id,"path":str,"force":bool=false,"relinkOthers":bool=true,"alignTimecode":bool=false,"match":{"fileName":bool,"extension":bool,"clipId":bool,"duration":bool,"mediaStart":bool,"metadata":bool}?}"#,
+            params: r#"{"item":id,"path":str,"force":bool=false,"background":bool=false,"openThreads":int?,"relinkOthers":bool=true,"alignTimecode":bool=false,"match":{"fileName":bool,"extension":bool,"clipId":bool,"duration":bool,"mediaStart":bool,"metadata":bool}?}"#,
             enabled: always,
             run: relink,
             journal: true,
@@ -697,7 +755,7 @@ pub fn commands() -> Vec<CommandSpec> {
             label: "Relink Moved Media",
             menu: &[],
             shortcut: None,
-            params: r#"{"from":str,"to":str}|{"folder":str} + match options"#,
+            params: r#"{"from":str,"to":str}|{"folder":str} + background:bool=false, openThreads:int?, match options"#,
             enabled: always,
             run: auto_relink,
             journal: true,

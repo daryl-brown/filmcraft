@@ -641,7 +641,11 @@ fn relink_to(app: &mut FilmcraftApp, d: &mut LinkMediaDraft, item: &Value, path:
     let mut p = match_params(d);
     p["item"] = item.clone();
     p["path"] = json!(path);
+    p["background"] = json!(true);
     match app.session.execute("media.relink", p) {
+        Ok(v) if remember_relink(&mut app.pending_relinks, &v) => {
+            app.ui.status = tl!("Linking media").to_string();
+        }
         Ok(v) => {
             d.message.clear();
             d.candidates.clear();
@@ -649,5 +653,30 @@ fn relink_to(app: &mut FilmcraftApp, d: &mut LinkMediaDraft, item: &Value, path:
             app.ui.status = tlf!("Linked {n} clip(s)", n = v["relinked"].as_array().map_or(0, Vec::len));
         }
         Err(e) => d.message = e.to_string(),
+    }
+}
+
+fn remember_relink(pending: &mut Vec<u64>, result: &Value) -> bool {
+    if result["pending"] == true
+        && let Some(job) = result["job"].as_u64()
+    {
+        if !pending.contains(&job) {
+            pending.push(job);
+        }
+        return true;
+    }
+    false
+}
+
+#[cfg(test)]
+mod relink_job_tests {
+    #[test]
+    fn pending_job_is_remembered_once() {
+        let mut pending = Vec::new();
+        let result = serde_json::json!({"pending": true, "job": 7});
+        assert!(super::remember_relink(&mut pending, &result));
+        assert!(super::remember_relink(&mut pending, &result));
+        assert_eq!(pending, vec![7]);
+        assert!(!super::remember_relink(&mut pending, &serde_json::json!({"relinked": []})));
     }
 }

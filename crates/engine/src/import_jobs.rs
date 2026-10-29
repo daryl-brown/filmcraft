@@ -6,6 +6,9 @@
 //! Documents and image sequences remain immediate. Without `background`, and on wasm32,
 //! imports retain the synchronous command behaviour. `file.importStatus` polls, cancels or
 //! waits for import jobs (a 600000 ms default timeout, clamped to 1 to 3600000 ms).
+//! Relink prefetch jobs share the bounded pool and defer the original command until polling.
+//! Cancellation discards the deferred command; successful opens remain in the short-lived stash.
+//! `file.importStatus` returns these results in `commands`, separately from import outcomes.
 //! Outcomes have one owner: either the status command or `Session::take_import_outcomes`.
 //! A selected status query drains only that job's outcomes. Finished jobs commit in one
 //! undo group, including the files opened before cancellation. No success toast is added.
@@ -53,7 +56,15 @@ struct Results {
     skipped: u64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct CommandOutcome {
+    pub job: u64,
+    pub command: String,
+    pub result: std::result::Result<Value, String>,
+}
+
 pub struct PendingImport {
+    deferred: Option<(String, Value)>,
     pub job: u64,
     parent: Option<BinId>,
     results: Arc<Mutex<Results>>,
@@ -121,7 +132,7 @@ pub(crate) fn start(s: &mut Session, p: &Value, paths: Vec<String>, parent: Opti
     let results = Arc::new(Mutex::new(Results::default()));
     let current = Arc::new(Mutex::new(Vec::new()));
     let worker = Worker {
-        media: s.media.clone(), services: s.services.clone(), progress: job.progress.clone(), results: results.clone(), current: current.clone(),
+        stash: false, media: s.media.clone(), services: s.services.clone(), progress: job.progress.clone(), results: results.clone(), current: current.clone(),
         limit: open_limit(p, std::env::var("FILMCRAFT_OPEN_THREADS").ok().as_deref()),
     };
     let result = job.result.clone();
@@ -139,7 +150,7 @@ pub(crate) fn start(s: &mut Session, p: &Value, paths: Vec<String>, parent: Opti
     // Publish only after spawning succeeds, so a spawn failure cannot leave a pending job.
     std::thread::Builder::new().name("filmcraft-import".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
     s.jobs.push(job);
-    s.import_jobs.push(PendingImport { job: id, parent, results, current });
+    s.import_jobs.push(PendingImport { job: id, parent, results, current, deferred: None });
     out["job"] = json!(id);
     out["pending"] = json!(true);
     if bool_p(p, "wait").unwrap_or(false) {
@@ -148,6 +159,50 @@ pub(crate) fn start(s: &mut Session, p: &Value, paths: Vec<String>, parent: Opti
         merge_waited(&mut out, &waited);
     }
     Ok(out)
+}
+
+/// Open candidate files, then run the original command on the polling thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn defer(s: &mut Session, command: &str, p: &Value, paths: Vec<String>) -> Result<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let paths: Vec<String> = paths.into_iter().filter(|path| seen.insert(path.clone()) && !s.media.is_stashed(path)).collect();
+    let mut params = p.clone();
+    if let Some(params) = params.as_object_mut() {
+        params.remove("background");
+    }
+    if paths.is_empty() {
+        return s.execute(command, params);
+    }
+    let id = s.jobs.iter().map(|j| j.id).max().unwrap_or(0).checked_add(1)
+        .ok_or_else(|| EngineError::Other("job ids exhausted".into()))?;
+    let files = paths.len();
+    let job = crate::Job {
+        id, label: format!("Opening {files} files for Link Media"), progress: Default::default(), result: Default::default(),
+    };
+    job.progress.total.store(files as u64, Ordering::Relaxed);
+    let results = Arc::new(Mutex::new(Results::default()));
+    let current = Arc::new(Mutex::new(Vec::new()));
+    let worker = Worker {
+        stash: true, media: s.media.clone(), services: s.services.clone(), progress: job.progress.clone(),
+        results: results.clone(), current: current.clone(),
+        limit: open_limit(p, std::env::var("FILMCRAFT_OPEN_THREADS").ok().as_deref()),
+    };
+    let result = job.result.clone();
+    let run = move || {
+        let began = web_time::Instant::now();
+        worker.run_files(paths.into_iter().map(|path| (path, None)).collect());
+        let seconds = began.elapsed().as_secs_f64();
+        let frames = worker.progress.done.load(Ordering::Relaxed);
+        *lock(&result) = Some(Ok(filmcraft_export::Report {
+            path: String::new(), frames, seconds, bytes: 0, render_fps: frames as f64 / seconds.max(1e-6), extra_files: Vec::new(),
+        }));
+        worker.progress.finished.store(true, Ordering::Release);
+    };
+    let run = crate::export_tools::guard_job(job.progress.clone(), job.result.clone(), run);
+    std::thread::Builder::new().name("filmcraft-relink".into()).spawn(run).map_err(|e| EngineError::Other(e.to_string()))?;
+    s.import_jobs.push(PendingImport { job: id, parent: None, results, current, deferred: Some((command.to_string(), params)) });
+    s.jobs.push(job);
+    Ok(json!({"job": id, "pending": true, "files": files}))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -173,6 +228,7 @@ type IndexedOpens = Mutex<Vec<(usize, std::result::Result<Opened, String>)>>;
 
 #[cfg(not(target_arch = "wasm32"))]
 struct Worker {
+    stash: bool,
     media: Arc<crate::media_pool::MediaPool>,
     services: Arc<dyn crate::Services>,
     progress: Arc<filmcraft_export::Progress>,
@@ -196,6 +252,10 @@ impl Worker {
             }
             files.extend(self.files(path, &mut budget));
         }
+        self.run_files(files);
+    }
+
+    fn run_files(&self, files: Vec<(String, Option<usize>)>) {
         self.progress.total.store(files.len() as u64, Ordering::Relaxed);
         let next = std::sync::atomic::AtomicUsize::new(0);
         let opened = Mutex::new(Vec::new());
@@ -219,8 +279,10 @@ impl Worker {
             }
         }
         drop(results);
-        let n = lock(&self.results).opened.len();
-        *lock(&self.progress.status) = if self.cancelled() {
+        let n = if self.stash { self.progress.done.load(Ordering::Relaxed) as usize } else { lock(&self.results).opened.len() };
+        *lock(&self.progress.status) = if self.stash && self.cancelled() {
+            "Stopped: cancelled".to_string()
+        } else if self.cancelled() {
             format!("Stopped: committing {n} already opened file(s)")
         } else {
             format!("Opened {n} file(s)")
@@ -253,7 +315,11 @@ impl Worker {
             let Some((path, bin)) = files.get(index) else { break };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.open_one(index, path, *bin)))
                 .unwrap_or_else(|_| Err(format!("{path}: the file could not be opened (internal error)")));
-            lock(opened).push((index, result));
+            match result {
+                Ok(file) if self.stash => self.media.stash_source(path, file.source),
+                result if !self.stash => lock(opened).push((index, result)),
+                _ => {}
+            }
             let mut current = lock(&self.current);
             current.retain(|(i, _, _)| *i != index);
             if let Some(status) = current_status(&current) {
@@ -274,6 +340,10 @@ impl Worker {
             }
         }
         // One container open cannot be interrupted. Cancellation is checked between files.
+        if self.stash {
+            let source = self.media.open_file(path, &*self.services).map_err(|e| e.to_string())?;
+            return Ok(Opened { path: path.into(), name, identity: MediaIdentity { size: 0, fingerprint: 0 }, source, bin });
+        }
         self.open(path, name, bin).map_err(|e| format!("{path}: {e} ({:.1} s)", began.elapsed().as_secs_f64()))
     }
 
@@ -321,6 +391,18 @@ pub fn poll(s: &mut Session) {
             lock(&j.result).as_ref().and_then(|r| r.as_ref().err().cloned()).or_else(|| lock(&j.progress.error).clone())
         });
         let pending = s.import_jobs.remove(i);
+        if let Some((command, params)) = pending.deferred {
+            let _scope = crate::watchdog::scope("relink commit", &pending.job.to_string());
+            let result = if cancelled {
+                Err("cancelled".to_string())
+            } else if let Some(error) = failure {
+                Err(error)
+            } else {
+                s.execute(&command, params).map_err(|e| e.to_string())
+            };
+            s.command_results.push(CommandOutcome { job: pending.job, command, result });
+            continue;
+        }
         let _scope = crate::watchdog::scope("import commit", &pending.job.to_string());
         let mut results = std::mem::take(&mut *lock(&pending.results));
         if let Some(error) = failure {
@@ -435,7 +517,17 @@ pub(crate) fn status(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     s.import_results = remaining;
-    Ok(json!({"pending": pending, "jobs": jobs, "outcomes": outcomes}))
+    let mut commands = Vec::new();
+    let mut remaining = Vec::new();
+    for outcome in s.take_command_outcomes() {
+        if selected.is_none_or(|id| id == outcome.job) {
+            commands.push(outcome);
+        } else {
+            remaining.push(outcome);
+        }
+    }
+    s.command_results = remaining;
+    Ok(json!({"pending": pending, "jobs": jobs, "outcomes": outcomes, "commands": commands}))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
