@@ -1431,6 +1431,9 @@ fn build() -> Vec<CommandSpec> {
                 let name = s.project.name.clone();
                 s.execute("file.newProject", json!({ "name": name }))?;
             }
+            if !bool_p(p, "imageSequence").unwrap_or(false) && paths.iter().any(|path| crate::media_browser::is_folder(&*s.services, path)) {
+                return crate::media_browser::import_paths(s, paths, bin.map(|b| b.0), false, "file.import");
+            }
             let mut ids = Vec::new();
             let mut errors = Vec::new();
             let mut sequences = Vec::new();

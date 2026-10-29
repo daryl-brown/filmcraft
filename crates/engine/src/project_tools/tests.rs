@@ -51,6 +51,8 @@ fn file_edit_clip_menu_order_and_shortcuts_match_premiere() {
             "media.makeOffline",
             "file.importFromMediaBrowser",
             "file.import",
+            "file.importFolder",
+            "file.importImageSequence",
             "file.projectManager",
         ],
     );
@@ -75,6 +77,7 @@ fn file_edit_clip_menu_order_and_shortcuts_match_premiere() {
         ],
     );
     for (id, label, sc) in [
+        ("file.importFolder", "Import Folder…", None),
         ("file.close", "Close", Some("Cmd+W")),
         ("file.importFromMediaBrowser", "Import from Media Browser", Some("Cmd+Alt+I")),
         ("file.mediaProperties", "Selection…", Some("Cmd+Shift+H")),

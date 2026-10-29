@@ -435,17 +435,32 @@ struct Folder {
     subs: Vec<Folder>,
 }
 
+/// A later card recogniser can replace or extend this folder import decision.
+fn folder_import_wants(_name: &str, kind: &str) -> bool {
+    matches!(kind, "video" | "audio" | "image")
+}
+
+/// Whether `path` is a directory the host can list (a name `kind_of` knows is a file, whatever it is).
+pub(crate) fn is_folder(services: &dyn Services, path: &str) -> bool {
+    kind_of(path).is_none() && matches!(services.list_entries(path), Some(Ok(_)))
+}
+
 /// The files the browser shows in `dir` and its sub-folders, as a tree; `None` when the tree
 /// holds none (or `budget` folders were walked already).
-fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budget: &mut usize) -> Option<Folder> {
+fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budget: &mut usize, skipped: &mut u64) -> Option<Folder> {
     *budget = budget.checked_sub(1)?;
     let entries = list(services, dir, "all").ok()?;
     let mut folder = Folder { name: base_name(dir), files: Vec::new(), subs: Vec::new() };
     for e in entries {
         if !e.is_dir {
-            folder.files.push(e.path);
+            if folder_import_wants(&e.name, &e.kind) {
+                folder.files.push(e.path);
+            } else {
+                // Unknown extensions are not listed by `list`, so they are not counted.
+                *skipped = skipped.saturating_add(1);
+            }
         } else if depth < FOLDER_IMPORT_MAX_DEPTH
-            && let Some(sub) = walk_folder(services, &e.path, depth + 1, budget)
+            && let Some(sub) = walk_folder(services, &e.path, depth + 1, budget, skipped)
         {
             folder.subs.push(sub);
         }
@@ -507,12 +522,18 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let seq = bool_p(p, "imageSequence").unwrap_or(s.prefs.media_browser.import_as_image_sequence);
     let bin = u64_p(p, "bin");
+    import_paths(s, paths, bin, seq, "mediaBrowser.import")
+}
+
+/// Import `paths` (files, and folders as bins of their media); `who` names the command in errors.
+pub(crate) fn import_paths(s: &mut Session, paths: Vec<String>, bin: Option<u64>, seq: bool, who: &str) -> Result<Value> {
+    let mut skipped = 0u64;
     let mut files = Vec::new();
     let mut folders = Vec::new();
     let mut empty = Vec::new();
     let mut budget = FOLDER_IMPORT_MAX_FOLDERS;
     for path in paths {
-        let is_dir = matches!(s.services.list_entries(&path), Some(Ok(_))) && kind_of(&path).is_none();
+        let is_dir = is_folder(&*s.services, &path);
         if !is_dir {
             files.push(path);
         } else if seq {
@@ -522,7 +543,7 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
                 Err(_) => files.push(path),
             }
         } else {
-            match walk_folder(&*s.services, &path, 0, &mut budget) {
+            match walk_folder(&*s.services, &path, 0, &mut budget, &mut skipped) {
                 Some(f) => folders.push(f),
                 None => empty.push(path),
             }
@@ -534,22 +555,33 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if folders.is_empty() {
         if files.is_empty() && !empty.is_empty() {
-            return Err(bad("mediaBrowser.import", format!("no media files in {}", empty.join(", "))));
+            return Err(bad(who, format!("no media files in {}", empty.join(", "))));
         }
         let mut q = json!({"paths": files, "imageSequence": seq});
         if let Some(b) = bin {
             q["bin"] = json!(b);
         }
-        return s.execute("file.import", q);
+        let mut result = s.execute("file.import", q)?;
+        result["skipped"] = json!(skipped);
+        if !empty.is_empty() {
+            result["bins"] = json!([]);
+        }
+        if let Some(errors) = result["errors"].as_array_mut() {
+            errors.extend(empty.iter().map(|path| json!(format!("no media files in {path}"))));
+        }
+        return Ok(result);
     }
     let mut out = serde_json::Map::new();
-    merge_import(&mut out, json!({"items": [], "errors": empty.iter().map(|e| format!("{e}: no media files")).collect::<Vec<_>>(), "bins": []}));
+    merge_import(&mut out, json!({"items": [], "errors": empty.iter().map(|e| format!("no media files in {e}")).collect::<Vec<_>>(), "bins": []}));
     if !files.is_empty() {
         import_into(s, &files, bin, &mut out);
     }
     for f in &folders {
-        import_folder(s, f, bin, &mut out)?;
+        if let Err(e) = import_folder(s, f, bin, &mut out) {
+            merge_import(&mut out, json!({"errors": [e.to_string()]}));
+        }
     }
+    out.insert("skipped".into(), json!(skipped));
     Ok(Value::Object(out))
 }
 
@@ -802,5 +834,18 @@ mod tests {
         // kept them); they must not collapse to the epoch (reviewer FredApps).
         assert_eq!(format_date(10_000_000_000_000), "318857-05-20 17:46");
         assert_eq!(format_date(u64::MAX), "584554051223-11-09 07:00");
+    }
+}
+
+#[cfg(test)]
+mod folder_import_tests {
+    #[test]
+    fn folder_import_wants_truth_table() {
+        for kind in ["video", "audio", "image"] {
+            assert!(super::folder_import_wants("clip", kind));
+        }
+        for kind in ["project", "caption", "folder", "", "unknown"] {
+            assert!(!super::folder_import_wants("clip", kind));
+        }
     }
 }

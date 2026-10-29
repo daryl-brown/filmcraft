@@ -219,3 +219,32 @@ fn export_location_browse_works_with_the_runner_and_with_synchronous_pickers() {
     assert_eq!(d.app().ui.export.location, "/tmp/exports-b");
     assert!(!d.app().native_dialog_open());
 }
+
+#[test]
+fn import_folder_opens_a_folder_dialog_and_preserves_bin() {
+    let mut d = Driver::new(true);
+    let bin = d.app().session.project.add_bin("Target", None);
+    assert_eq!(d.ok("ui.menu.invoke", json!({"id": "file.importFolder", "params": {"bin": bin.0}})), json!({"dialog": "open"}));
+    let (dialog, answer) = d.asked();
+    assert!(matches!(dialog, FileDialog::Folder { at: None }));
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("native-import-folder");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("tone.wav"), filmcraft_media::wav::write_wav16(&[0.0; 4800], 2, 48_000)).unwrap();
+    answer.send(vec![dir.to_string_lossy().into_owned()]).unwrap();
+    d.frames(2);
+    assert!(!d.app().native_dialog_open());
+    let target = d
+        .app()
+        .session
+        .project
+        .root
+        .children
+        .iter()
+        .find_map(|entry| match entry {
+            filmcraft_project::BinEntry::Bin(b) if b.id == bin => Some(b),
+            _ => None,
+        })
+        .unwrap();
+    assert!(target.children.iter().any(|entry| matches!(entry, filmcraft_project::BinEntry::Bin(_))));
+    let _ = std::fs::remove_dir_all(&dir);
+}
