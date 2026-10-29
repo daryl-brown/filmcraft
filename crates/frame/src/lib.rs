@@ -478,8 +478,13 @@ impl VideoFrame {
             PixelData::Yuv16 { planes, chroma, bits, alpha } => {
                 let (sx, sy) = chroma.shifts();
                 let cw = w.div_ceil(1 << sx);
+                let ch = h.div_ceil(1 << sy);
+                let fits = planes[0].len() >= w * h && planes[1].len() >= cw * ch && planes[2].len() >= cw * ch;
+                if alpha.is_some() || *bits > 12 || !fits {
+                    self.convert_yuv16_generic(n, &q, r, out);
+                    return;
+                }
                 let bits = *bits;
-                let amax = ((1u32 << bits) - 1) as f32;
                 // Per-code tables (exactly the values `normalize_*` returns) instead of two
                 // divisions per sample; a code past the table (a corrupt plane) is computed.
                 let codes = if bits <= 12 { 1usize << bits } else { 0 };
@@ -487,35 +492,64 @@ impl VideoFrame {
                 let ctab: Vec<f32> = (0..codes as u32).map(|v| normalize_c(v, bits, info.range)).collect();
                 let ny = |v: u16| ytab.get(usize::from(v)).copied().unwrap_or_else(|| normalize_y(u32::from(v), bits, info.range));
                 let nc = |v: u16| ctab.get(usize::from(v)).copied().unwrap_or_else(|| normalize_c(u32::from(v), bits, info.range));
-                out.par_chunks_mut(r.w * 4).enumerate().for_each(|(ry, row)| {
-                    let oy = r.y + ry;
-                    for rx in 0..r.w {
-                        let ox = r.x + rx;
-                        let mut acc = [0f32; 4];
-                        for dy in 0..n {
-                            let y = (oy * n + dy).min(h - 1);
-                            let cy = y >> sy;
-                            for dx in 0..n {
-                                let x = (ox * n + dx).min(w - 1);
-                                let cx = x >> sx;
-                                let yy = ny(planes[0][y * w + x]);
-                                let u = nc(planes[1][cy * cw + cx]);
-                                let v = nc(planes[2][cy * cw + cx]);
-                                let rgb = ycbcr_to_rgb(yy, u, v, info.matrix);
-                                let a = alpha.as_ref().map_or(1.0, |al| al[y * w + x] as f32 / amax);
-                                acc[0] += q(rgb[0]) * a;
-                                acc[1] += q(rgb[1]) * a;
-                                acc[2] += q(rgb[2]) * a;
-                                acc[3] += a;
-                            }
-                        }
-                        for k in 0..4 {
-                            row[rx * 4 + k] = acc[k] * inv;
-                        }
-                    }
-                });
+                if codes > 0 {
+                    let (kr, kb) = info.matrix.kr_kb();
+                    let kg = 1.0 - kr - kb;
+                    let fast = Yuv16Fast {
+                        planes, w, h, cw, sx, sy, kr, kb, kg, cr_r: 2.0 * (1.0 - kr), cb_b: 2.0 * (1.0 - kb), ny: &ny, nc: &nc, q: &q, inv,
+                    };
+                    out.par_chunks_mut(r.w * 4).enumerate().for_each(|(ry, row)| fast.row(n, r.x, r.y + ry, row));
+                } else {
+                    self.convert_yuv16_generic(n, &q, r, out);
+                }
             }
         }
+    }
+
+    // Reference conversion, also used for alpha, high bit depths and incomplete planes.
+    fn convert_yuv16_generic(&self, n: usize, q: &(dyn Fn(f32) -> f32 + Sync), r: Region, out: &mut [f32]) {
+        let PixelData::Yuv16 { planes, chroma, bits, alpha } = &self.data else { return };
+        let (w, h) = (self.width as usize, self.height as usize);
+        let info = self.color;
+        let inv = 1.0 / (n as f32 * n as f32);
+        let (sx, sy) = chroma.shifts();
+        let cw = w.div_ceil(1 << sx);
+        let bits = *bits;
+        let amax = ((1u32 << bits) - 1) as f32;
+        // Per-code tables (exactly the values `normalize_*` returns) instead of two
+        // divisions per sample; a code past the table (a corrupt plane) is computed.
+        let codes = if bits <= 12 { 1usize << bits } else { 0 };
+        let ytab: Vec<f32> = (0..codes as u32).map(|v| normalize_y(v, bits, info.range)).collect();
+        let ctab: Vec<f32> = (0..codes as u32).map(|v| normalize_c(v, bits, info.range)).collect();
+        let ny = |v: u16| ytab.get(usize::from(v)).copied().unwrap_or_else(|| normalize_y(u32::from(v), bits, info.range));
+        let nc = |v: u16| ctab.get(usize::from(v)).copied().unwrap_or_else(|| normalize_c(u32::from(v), bits, info.range));
+        out.par_chunks_mut(r.w * 4).enumerate().for_each(|(ry, row)| {
+            let oy = r.y + ry;
+            for rx in 0..r.w {
+                let ox = r.x + rx;
+                let mut acc = [0f32; 4];
+                for dy in 0..n {
+                    let y = (oy * n + dy).min(h - 1);
+                    let cy = y >> sy;
+                    for dx in 0..n {
+                        let x = (ox * n + dx).min(w - 1);
+                        let cx = x >> sx;
+                        let yy = ny(planes[0][y * w + x]);
+                        let u = nc(planes[1][cy * cw + cx]);
+                        let v = nc(planes[2][cy * cw + cx]);
+                        let rgb = ycbcr_to_rgb(yy, u, v, info.matrix);
+                        let a = alpha.as_ref().map_or(1.0, |al| al[y * w + x] as f32 / amax);
+                        acc[0] += q(rgb[0]) * a;
+                        acc[1] += q(rgb[1]) * a;
+                        acc[2] += q(rgb[2]) * a;
+                        acc[3] += a;
+                    }
+                }
+                for k in 0..4 {
+                    row[rx * 4 + k] = acc[k] * inv;
+                }
+            }
+        });
     }
 
     /// Where the picture is not transparent: the smallest rectangle of the `n`×`n`-decimated
@@ -760,6 +794,109 @@ fn rotate_chroma<T: Copy + Default + Send + Sync>(planes: &[Arc<Vec<T>>; 3], chr
         return ([rotate_plane(&widen(&planes[1]), w, h, 1, q), rotate_plane(&widen(&planes[2]), w, h, 1, q)], Chroma::C444);
     }
     ([rotate_plane(&planes[1], cw, ch, 1, q), rotate_plane(&planes[2], cw, ch, 1, q)], chroma)
+}
+
+// All references are immutable and Sync so output rows retain the existing Rayon parallelism.
+struct Yuv16Fast<'a, Y, C, Q> {
+    planes: &'a [Arc<Vec<u16>>; 3],
+    w: usize,
+    h: usize,
+    cw: usize,
+    sx: u32,
+    sy: u32,
+    kr: f32,
+    kb: f32,
+    kg: f32,
+    cr_r: f32,
+    cb_b: f32,
+    ny: &'a Y,
+    nc: &'a C,
+    q: &'a Q,
+    inv: f32,
+}
+
+impl<Y, C, Q> Yuv16Fast<'_, Y, C, Q>
+where
+    Y: Fn(u16) -> f32 + Sync,
+    C: Fn(u16) -> f32 + Sync,
+    Q: Fn(f32) -> f32 + Sync,
+{
+    fn rows(&self, y: usize) -> [&[u16]; 3] {
+        let cy = y >> self.sy;
+        [
+            &self.planes[0][y * self.w..(y + 1) * self.w],
+            &self.planes[1][cy * self.cw..(cy + 1) * self.cw],
+            &self.planes[2][cy * self.cw..(cy + 1) * self.cw],
+        ]
+    }
+
+    #[inline]
+    fn tap(&self, rows: [&[u16]; 3], x: usize, acc: &mut [f32; 4]) {
+        let cx = x >> self.sx;
+        let yy = (self.ny)(rows[0][x]);
+        let u = (self.nc)(rows[1][cx]);
+        let v = (self.nc)(rows[2][cx]);
+        let r = yy + self.cr_r * v;
+        let b = yy + self.cb_b * u;
+        let g = (yy - self.kr * r - self.kb * b) / self.kg;
+        let a = 1.0;
+        acc[0] += (self.q)(r) * a;
+        acc[1] += (self.q)(g) * a;
+        acc[2] += (self.q)(b) * a;
+        acc[3] += a;
+    }
+
+    fn row(&self, n: usize, ox: usize, oy: usize, row: &mut [f32]) {
+        match n {
+            1 => self.row_one(ox, oy, row),
+            2 => self.row_two(ox, oy, row),
+            _ => self.row_many(n, ox, oy, row),
+        }
+    }
+
+    fn row_one(&self, ox: usize, oy: usize, row: &mut [f32]) {
+        let rows = self.rows(oy.min(self.h - 1));
+        for (rx, pixel) in row.chunks_exact_mut(4).enumerate() {
+            let mut acc = [0.0; 4];
+            self.tap(rows, (ox + rx).min(self.w - 1), &mut acc);
+            for k in 0..4 {
+                pixel[k] = acc[k] * self.inv;
+            }
+        }
+    }
+
+    fn row_two(&self, ox: usize, oy: usize, row: &mut [f32]) {
+        let top = self.rows((oy * 2).min(self.h - 1));
+        let bottom = self.rows((oy * 2 + 1).min(self.h - 1));
+        for (rx, pixel) in row.chunks_exact_mut(4).enumerate() {
+            let x = (ox + rx) * 2;
+            let x0 = x.min(self.w - 1);
+            let x1 = (x + 1).min(self.w - 1);
+            let mut acc = [0.0; 4];
+            self.tap(top, x0, &mut acc);
+            self.tap(top, x1, &mut acc);
+            self.tap(bottom, x0, &mut acc);
+            self.tap(bottom, x1, &mut acc);
+            for k in 0..4 {
+                pixel[k] = acc[k] * self.inv;
+            }
+        }
+    }
+
+    fn row_many(&self, n: usize, ox: usize, oy: usize, row: &mut [f32]) {
+        for (rx, pixel) in row.chunks_exact_mut(4).enumerate() {
+            let mut acc = [0.0; 4];
+            for dy in 0..n {
+                let rows = self.rows((oy * n + dy).min(self.h - 1));
+                for dx in 0..n {
+                    self.tap(rows, ((ox + rx) * n + dx).min(self.w - 1), &mut acc);
+                }
+            }
+            for k in 0..4 {
+                pixel[k] = acc[k] * self.inv;
+            }
+        }
+    }
 }
 
 #[cfg(test)]

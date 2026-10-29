@@ -398,3 +398,113 @@ fn full_size_yuv8_tables_give_the_per_pixel_values_bit_for_bit() {
         }
     }
 }
+
+fn random_yuv16(w: usize, h: usize, chroma: Chroma, bits: u32) -> VideoFrame {
+    let mut seed = 0x2545_f491u32;
+    let max = (1u32 << bits) - 1;
+    let mut plane = |len| {
+        Arc::new(
+            (0..len)
+                .map(|i| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    match i % 7 {
+                        0 => 0,
+                        1 => max as u16,
+                        _ => (seed & max) as u16,
+                    }
+                })
+                .collect(),
+        )
+    };
+    let (sx, sy) = chroma.shifts();
+    let clen = w.div_ceil(1 << sx) * h.div_ceil(1 << sy);
+    VideoFrame {
+        width: w as u32,
+        height: h as u32,
+        data: PixelData::Yuv16 { planes: [plane(w * h), plane(clen), plane(clen)], chroma, bits, alpha: None },
+        color: ColorInfo::REC709,
+        par: (1, 1),
+        pts: Tick::ZERO,
+    }
+}
+
+fn assert_yuv16_reference(f: &VideoFrame, n: usize, decode: Option<&DecodeTable>) {
+    let n = f.bounded_decimation(n);
+    let (w, h, full) = f.to_linear_f32_decimated_with(n, decode);
+    let lin: Vec<f32> = (0..4096).map(|i| to_linear(i as f32 / 4095.0, f.color.transfer)).collect();
+    let q = |v: f32| match decode {
+        Some(t) => t.lookup(v),
+        None => lin[(v.clamp(0.0, 1.0) * 4095.0 + 0.5) as usize],
+    };
+    let full_region = Region { x: 0, y: 0, w, h };
+    let sub = Region { x: w / 3, y: h / 3, w: (w / 2).max(1), h: (h / 2).max(1) };
+    for want in [full_region, sub] {
+        let (r, got) = if want == full_region { (want, full.clone()) } else { f.to_linear_f32_region(n, decode, want) };
+        let mut reference = vec![f32::NAN; r.w * r.h * 4];
+        f.convert_yuv16_generic(n, &q, r, &mut reference);
+        for (i, (a, b)) in got.iter().zip(&reference).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "n={n} {r:?} element {i} {:?}", f.color);
+        }
+    }
+}
+
+fn check_yuv16_colours(mut f: VideoFrame) {
+    let curve = DecodeTable::new(0.0, 1.0, 4096, |v| v.max(0.0).powf(2.4));
+    for matrix in [Matrix::Bt601, Matrix::Bt709, Matrix::Bt2020Ncl] {
+        for range in [Range::Limited, Range::Full] {
+            for transfer in [filmcraft_color::Transfer::Srgb, filmcraft_color::Transfer::Hlg] {
+                f.color = ColorInfo { matrix, range, transfer, ..ColorInfo::REC709 };
+                for n in [1, 2, 3, 4, 5, 8] {
+                    for decode in [None, Some(&curve)] {
+                        assert_yuv16_reference(&f, n, decode);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn yuv16_fast_paths_match_generic_bits() {
+    for (w, h) in [(37, 23), (64, 36), (1, 1), (3, 1)] {
+        for chroma in [Chroma::C420, Chroma::C422, Chroma::C444] {
+            for bits in [9, 10, 11, 12] {
+                check_yuv16_colours(random_yuv16(w, h, chroma, bits));
+            }
+        }
+    }
+}
+
+#[test]
+fn yuv16_corrupt_codes_and_fallbacks_match_generic() {
+    let mut corrupt = random_yuv16(7, 5, Chroma::C420, 10);
+    if let PixelData::Yuv16 { planes, .. } = &mut corrupt.data {
+        for plane in planes {
+            Arc::make_mut(plane)[0] = u16::MAX;
+        }
+    }
+    check_yuv16_colours(corrupt);
+    let mut alpha = random_yuv16(7, 5, Chroma::C422, 10);
+    if let PixelData::Yuv16 { alpha, .. } = &mut alpha.data {
+        *alpha = Some(Arc::new((0..35).map(|i| (i * 31) as u16).collect()));
+    }
+    check_yuv16_colours(alpha);
+    check_yuv16_colours(random_yuv16(7, 5, Chroma::C444, 16));
+
+    // The original generic loop indexes short planes directly and panics. Preserve that fallback.
+    for short_plane in 0..3 {
+        let mut short = random_yuv16(7, 5, Chroma::C420, 10);
+        if let PixelData::Yuv16 { planes, .. } = &mut short.data {
+            planes[short_plane] = Arc::new(Vec::new());
+        }
+        let r = Region { x: 0, y: 0, w: 7, h: 5 };
+        let generic = std::panic::catch_unwind(|| {
+            let mut out = vec![0.0; 7 * 5 * 4];
+            short.convert_yuv16_generic(1, &|v| v, r, &mut out);
+        });
+        let actual = std::panic::catch_unwind(|| short.to_linear_f32_decimated(1));
+        assert!(generic.is_err() && actual.is_err());
+    }
+}
