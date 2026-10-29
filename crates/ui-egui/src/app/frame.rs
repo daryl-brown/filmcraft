@@ -98,6 +98,12 @@ impl FilmcraftApp {
     /// render completes. Runs every frame, with or without the status bar.
     pub(super) fn poll_jobs(&mut self, ctx: &egui::Context) -> Option<filmcraft_engine::Job> {
         use std::sync::atomic::Ordering;
+        for outcome in self.session.take_import_outcomes() {
+            if let Some(drop) = super::input::complete_import_drop(&mut self.pending_import_drops, outcome) {
+                self.pending_timeline_drop = Some(drop);
+                ctx.request_repaint();
+            }
+        }
         let running = self.session.jobs.iter().rev().find(|j| !j.progress.finished.load(Ordering::Relaxed)).cloned();
         // Play after rendering previews.
         if let Some((id, from)) = self.watched_render
@@ -138,11 +144,18 @@ impl FilmcraftApp {
         let p = ui.painter();
         p.rect_filled(bar, 3.0, t.separator);
         p.rect_filled(egui::Rect::from_min_size(bar.min, egui::vec2(bar.width() * f, bar.height())), 3.0, t.accent);
-        let verb = if job.label.starts_with("Rendering") { crate::i18n::t(&job.label).to_string() } else { tl!("Exporting").to_string() };
+        let opening = job.label.starts_with("Opening ");
+        let verb = if opening || job.label.starts_with("Rendering") { crate::i18n::t(&job.label).to_string() } else { tl!("Exporting").to_string() };
+        let text = if opening {
+            let status = job.progress.status.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            format!("{verb}: {status}")
+        } else {
+            format!("{verb}… {:.0}%{left}", f * 100.0)
+        };
         p.text(
             egui::pos2(bar.min.x - 8.0, sb.center().y),
             egui::Align2::RIGHT_CENTER,
-            format!("{verb}… {:.0}%{left}", f * 100.0),
+            text,
             Tokens::ui(11.0),
             t.text_dim,
         );

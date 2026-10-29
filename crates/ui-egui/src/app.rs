@@ -12,7 +12,7 @@ mod files;
 mod frame;
 mod gpu;
 mod ime;
-mod input;
+pub(crate) mod input;
 mod keys;
 mod playback;
 mod prefs;
@@ -100,6 +100,7 @@ impl FilmcraftApp {
             last_timeline_width: 1000.0,
             timeline_view_of: None,
             pending_timeline_drop: None,
+            pending_import_drops: Vec::new(),
             file_drag_hover: None,
             window_files: Vec::new(),
             timeline_view_last: None,

@@ -425,14 +425,14 @@ fn paths_p(s: &Session, p: &Value) -> Vec<String> {
 
 /// Most folders one import walks, and how deep it goes: a folder import mirrors the tree as bins,
 /// and symlinked folders can loop.
-const FOLDER_IMPORT_MAX_FOLDERS: usize = 4096;
+pub(crate) const FOLDER_IMPORT_MAX_FOLDERS: usize = 4096;
 const FOLDER_IMPORT_MAX_DEPTH: usize = 32;
 
 /// A folder to import as a bin: its name, its files and its sub-folders that hold files.
-struct Folder {
-    name: String,
-    files: Vec<String>,
-    subs: Vec<Folder>,
+pub(crate) struct Folder {
+    pub name: String,
+    pub files: Vec<String>,
+    pub subs: Vec<Folder>,
 }
 
 /// A later card recogniser can replace or extend this folder import decision.
@@ -447,7 +447,7 @@ pub(crate) fn is_folder(services: &dyn Services, path: &str) -> bool {
 
 /// The files the browser shows in `dir` and its sub-folders, as a tree; `None` when the tree
 /// holds none (or `budget` folders were walked already).
-fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budget: &mut usize, skipped: &mut u64) -> Option<Folder> {
+pub(crate) fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budget: &mut usize, skipped: &mut u64) -> Option<Folder> {
     *budget = budget.checked_sub(1)?;
     let entries = list(services, dir, "all").ok()?;
     let mut folder = Folder { name: base_name(dir), files: Vec::new(), subs: Vec::new() };

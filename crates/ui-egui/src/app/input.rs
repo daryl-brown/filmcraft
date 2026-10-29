@@ -17,6 +17,7 @@ impl FilmcraftApp {
         if !dropped.is_empty() {
             let pointer = self.drop_pointer(ctx, egui::ViewportId::ROOT, None);
             self.import_dropped(&dropped, pointer.map(|p| (p, egui::ViewportId::ROOT)));
+            ctx.request_repaint();
         }
         for files in std::mem::take(&mut self.window_files) {
             // Only the Timeline places files at the pointer; elsewhere they go to the bin.
@@ -28,6 +29,7 @@ impl FilmcraftApp {
             }
             if !files.dropped.is_empty() {
                 self.import_dropped(&files.dropped, pointer.map(|p| (p, files.viewport)));
+                ctx.request_repaint();
             }
         }
     }
@@ -39,14 +41,16 @@ impl FilmcraftApp {
         if paths.is_empty() {
             return;
         }
-        let imported = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0}));
+        let imported = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0, "background": true}));
         if let Ok(v) = imported
             && let Some((pos, viewport)) = pointer
             && self.session.prefs.timeline.drop_import_to_timeline
         {
             let items: Vec<filmcraft_engine::project::ItemId> =
                 v["items"].as_array().map(|a| a.iter().filter_map(|i| i.as_u64()).map(filmcraft_engine::project::ItemId).collect()).unwrap_or_default();
-            if !items.is_empty() {
+            if let Some(job) = v["job"].as_u64() {
+                self.pending_import_drops.push(PendingImportDrop { job, items, pos, viewport });
+            } else if !items.is_empty() {
                 self.pending_timeline_drop = Some((items, pos, viewport));
             }
         }
@@ -135,5 +139,44 @@ mod screen_px_tests {
             let p = screen_px_to_ui((10, 20), ppp, egui::pos2(0.0, 0.0));
             assert!(p.x.is_finite() && p.y.is_finite());
         }
+    }
+}
+
+/// A timeline drop waits for its import outcome, retaining any immediate document items.
+pub(crate) struct PendingImportDrop {
+    pub job: u64,
+    pub items: Vec<filmcraft_engine::project::ItemId>,
+    pub pos: egui::Pos2,
+    pub viewport: egui::ViewportId,
+}
+
+pub(crate) fn complete_import_drop(
+    pending: &mut Vec<PendingImportDrop>,
+    outcome: filmcraft_engine::import_jobs::ImportOutcome,
+) -> Option<(Vec<filmcraft_engine::project::ItemId>, egui::Pos2, egui::ViewportId)> {
+    let index = pending.iter().position(|drop| drop.job == outcome.job)?;
+    let mut drop = pending.remove(index);
+    drop.items.extend(outcome.items);
+    (!drop.items.is_empty()).then_some((drop.items, drop.pos, drop.viewport))
+}
+
+#[cfg(test)]
+mod import_drop_tests {
+    use super::{PendingImportDrop, complete_import_drop};
+    use filmcraft_engine::import_jobs::ImportOutcome;
+    use filmcraft_engine::project::ItemId;
+
+    #[test]
+    fn timeline_drop_waits_for_matching_outcome_and_merges_immediate_items() {
+        let pos = egui::pos2(42.0, 17.0);
+        let viewport = egui::ViewportId::ROOT;
+        let mut pending = vec![PendingImportDrop { job: 7, items: vec![ItemId(1)], pos, viewport }];
+        let outcome = |job| ImportOutcome { job, items: vec![ItemId(2)], errors: Vec::new(), bins: Vec::new(), skipped: 0 };
+        assert!(complete_import_drop(&mut pending, outcome(8)).is_none());
+        assert_eq!(pending.len(), 1);
+        let completed = complete_import_drop(&mut pending, outcome(7)).unwrap();
+        assert_eq!(completed, (vec![ItemId(1), ItemId(2)], pos, viewport));
+        assert!(pending.is_empty());
+        assert!(complete_import_drop(&mut pending, outcome(7)).is_none());
     }
 }

@@ -18,6 +18,18 @@ fn step(h: &mut Harness<'static, FilmcraftApp>) {
     h.step();
 }
 
+/// Let workers finish through normal frame polling, without draining the UI's outcomes.
+fn settle_imports(h: &mut Harness<'static, FilmcraftApp>) {
+    let began = std::time::Instant::now();
+    while !h.state().session.import_jobs.is_empty() {
+        assert!(began.elapsed() < std::time::Duration::from_secs(30), "import did not finish");
+        step(h);
+        std::thread::yield_now();
+    }
+    step(h);
+    step(h);
+}
+
 fn harness() -> Harness<'static, FilmcraftApp> {
     let mut s = Session::default();
     s.execute("file.openDemoProject", json!({})).unwrap();
@@ -68,7 +80,7 @@ fn drop_on_row(h: &mut Harness<'static, FilmcraftApp>, row_control: &str, path: 
     h.input_mut().dropped_files.push(std::sync::Arc::new(OsFile(path.to_path_buf())));
     step(h);
     h.input_mut().dropped_files.clear();
-    step(h);
+    settle_imports(h);
 }
 
 /// (video clips, audio clips) on the active sequence.
@@ -158,7 +170,7 @@ fn drop_on_empty_timeline(h: &mut Harness<'static, FilmcraftApp>, path: &Path) {
     h.input_mut().dropped_files.push(std::sync::Arc::new(OsFile(path.to_path_buf())));
     step(h);
     h.input_mut().dropped_files.clear();
-    step(h);
+    settle_imports(h);
 }
 
 #[test]
@@ -201,7 +213,7 @@ fn several_files_dropped_together_are_placed_in_one_undo_step() {
     }
     step(&mut h);
     h.input_mut().dropped_files.clear();
-    step(&mut h);
+    settle_imports(&mut h);
     assert_eq!(clip_counts(&h), (3, 0), "status: {}", h.state().ui.status);
     let spans: Vec<(i64, i64)> = {
         let q = h.state().session.active_sequence().unwrap();
@@ -227,7 +239,7 @@ fn drop_at(h: &mut Harness<'static, FilmcraftApp>, pos: egui::Pos2, path: &Path)
     h.input_mut().dropped_files.push(std::sync::Arc::new(OsFile(path.to_path_buf())));
     step(h);
     h.input_mut().dropped_files.clear();
-    step(h);
+    settle_imports(h);
 }
 
 fn hover_at(h: &mut Harness<'static, FilmcraftApp>, pos: egui::Pos2) -> bool {
@@ -318,13 +330,13 @@ fn os_cursor_hook_selects_destination_when_egui_pointer_has_no_motion() {
     h.input_mut().dropped_files.push(std::sync::Arc::new(OsFile(still("drop_os_hook_covered.png"))));
     step(&mut h);
     h.input_mut().dropped_files.clear();
-    step(&mut h);
+    settle_imports(&mut h);
     assert_eq!(clip_counts(&h), (0, 0));
     h.state_mut().ui.dock.floating.clear();
     h.input_mut().dropped_files.push(std::sync::Arc::new(OsFile(still("drop_os_hook_visible.png"))));
     step(&mut h);
     h.input_mut().dropped_files.clear();
-    step(&mut h);
+    settle_imports(&mut h);
     assert_eq!(clip_counts(&h), (1, 0));
 }
 
@@ -344,4 +356,68 @@ fn a_floating_window_hidden_by_a_maximized_timeline_does_not_block_drops() {
     }
     assert_eq!(point_on_row(&h, "timeline.track.V1.target"), at);
     assert!(hover_at(&mut h, at));
+}
+
+#[test]
+fn gated_timeline_drop_places_the_outcome_at_the_saved_pointer() {
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+    use filmcraft_engine::{FsServices, Services};
+
+    struct GatedServices {
+        path: String,
+        gate: Mutex<Option<mpsc::Receiver<()>>>,
+        entered: mpsc::Sender<()>,
+    }
+
+    impl Services for GatedServices {
+        fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            if path == self.path {
+                if let Some(gate) = self.gate.lock().unwrap().take() {
+                    self.entered.send(()).unwrap();
+                    gate.recv_timeout(Duration::from_secs(30)).map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))?;
+                }
+            }
+            FsServices.read_file(path)
+        }
+
+        fn write_file(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+            FsServices.write_file(path, bytes)
+        }
+
+        fn file_size(&self, path: &str) -> std::io::Result<u64> {
+            FsServices.file_size(path)
+        }
+    }
+
+    let path = tone("gated_timeline_drop.wav");
+    let (release, gate) = mpsc::channel();
+    let (entered, ready) = mpsc::channel();
+    let services = GatedServices { path: path.to_string_lossy().to_string(), gate: Mutex::new(Some(gate)), entered };
+    let mut s = Session::new(Arc::new(services));
+    s.execute("file.newSequence", json!({"name": "Gated drop", "width": 1280, "height": 720, "fps": 24})).unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1600.0, 980.0)).build_eframe(move |_cc| FilmcraftApp::new(s));
+    for _ in 0..4 {
+        step(&mut h);
+    }
+    let at = point_on_row(&h, "timeline.track.V1.target");
+    pointer_to(&mut h, at);
+    let before = h.state().session.project.items.len();
+    h.input_mut().dropped_files.push(Arc::new(OsFile(path.clone())));
+    step(&mut h);
+    h.input_mut().dropped_files.clear();
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(h.state().session.project.items.len(), before);
+    assert_eq!(clip_counts(&h), (0, 0));
+    // Moving away while opening must not change the saved destination.
+    pointer_to(&mut h, egui::pos2(5.0, 5.0));
+    assert_eq!(clip_counts(&h), (0, 0));
+    release.send(()).unwrap();
+    settle_imports(&mut h);
+    assert_eq!(clip_counts(&h), (0, 1));
+    let session = &h.state().session;
+    let clip = &session.active_sequence().unwrap().audio_tracks[0].items[0];
+    let media = session.project.item(clip.item).unwrap().as_media().unwrap();
+    assert!(matches!(&media.media, filmcraft_engine::project::MediaRef::File { path: actual } if actual == path.to_string_lossy().as_ref()));
+    assert!(clip.start.0 > 0);
 }

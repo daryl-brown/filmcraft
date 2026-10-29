@@ -11,9 +11,9 @@ use crate::{Services, Session};
 
 /// An in-memory filesystem: directories and files (with bytes).
 #[derive(Default)]
-struct FakeFs {
-    dirs: Vec<String>,
-    files: Mutex<BTreeMap<String, Vec<u8>>>,
+pub(crate) struct FakeFs {
+    pub(crate) dirs: Vec<String>,
+    pub(crate) files: Mutex<BTreeMap<String, Vec<u8>>>,
 }
 
 impl FakeFs {
@@ -328,7 +328,7 @@ fn ale_logs_are_not_offered_for_import() {
     assert_eq!(media_browser::kind_of("cut.edl"), Some("project"));
 }
 
-fn folder_fixture() -> FakeFs {
+pub(crate) fn folder_fixture() -> FakeFs {
     let mut fs = FakeFs::default();
     fs.dirs = ["/root", "/root/A", "/root/A/sub", "/root/B", "/empty", "/sidecars"].map(String::from).to_vec();
     let files = fs.files.get_mut().unwrap();

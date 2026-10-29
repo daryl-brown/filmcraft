@@ -738,11 +738,11 @@ pub fn import_image_sequence(s: &mut Session, path: &str, bin: Option<filmcraft_
 }
 
 /// Settings ▸ Media ▸ Import image sequences: a single numbered still with later frames beside it.
-fn detect_image_sequence(s: &Session, path: &str) -> bool {
+pub(crate) fn detect_image_sequence(s: &Session, path: &str) -> bool {
     filmcraft_media::sequence::Numbered::parse(path).is_some() && crate::media_pool::image_sequence_frames(path, &*s.services).is_ok_and(|f| f.len() > 1)
 }
 
-fn import_source(
+pub(crate) fn import_source(
     s: &mut Session,
     path: &str,
     name: String,
@@ -781,6 +781,61 @@ fn import_source(
     })?;
     s.media.insert_file(id, path, src);
     Ok(id)
+}
+
+/// Finish import analysis, ingest and offline recovery for both import paths.
+pub(crate) fn finish_import(
+    s: &mut Session,
+    ids: Vec<u64>,
+    mut errors: Vec<String>,
+    sequences: Vec<Value>,
+    reports: Vec<Value>,
+    image_sequences: Vec<Value>,
+) -> Result<Value> {
+    // Project Settings > Ingest: copy / transcode / create proxies
+    // (image sequences are many files: ingest copies and transcodes single files only)
+    let item_ids: Vec<ItemId> = ids.iter().filter(|i| !image_sequences.iter().any(|q| q["item"].as_u64() == Some(**i))).map(|i| ItemId(*i)).collect();
+    // Settings > Media Analysis & Transcription > Automatically transcribe clips
+    let ma = &s.prefs.media_analysis;
+    if ma.auto_transcribe && ma.auto_transcribe_scope == "allImported" && !ids.is_empty() {
+        let audio: Vec<u64> = ids.iter().copied().filter(|i| s.project.item(ItemId(*i)).is_some_and(|it| it.has_audio())).collect();
+        if !audio.is_empty() {
+            // without speech-to-text the setting can't act: say so instead of importing
+            // silently untranscribed (#89)
+            let r = crate::transcript::can_transcribe(s)
+                .map_err(EngineError::Other)
+                .and_then(|()| s.execute("transcript.generate", json!({"items": audio})));
+            if let Err(e) = r {
+                errors.push(format!("transcription: {e}"));
+            }
+        }
+    }
+    let ingest = match crate::proxies::ingest(s, &item_ids) {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(format!("ingest: {e}"));
+            Value::Null
+        }
+    };
+    let mut out = if !ingest.is_null() {
+        json!({"items": ids, "sequences": sequences, "documents": reports, "errors": errors, "ingest": ingest})
+    } else if reports.is_empty() {
+        json!({"items": ids, "errors": errors})
+    } else {
+        json!({"items": ids, "sequences": sequences, "documents": reports, "errors": errors})
+    };
+    if !image_sequences.is_empty() {
+        out["imageSequences"] = json!(image_sequences);
+    }
+    // Newly imported files may resolve paths the project already listed as offline
+    // (issue #110): rebuild s.offline.missing so the "Media missing" badge clears, and drop
+    // the cached slate of every item that came back so the monitors show the file again.
+    let was_missing = s.offline.missing.clone();
+    crate::relink::refresh(s);
+    for item in was_missing.iter().filter(|i| !s.offline.missing.contains(i)) {
+        s.media.remove(*item);
+    }
+    Ok(out)
 }
 
 fn new_generator(s: &mut Session, g: Generator, name: &str, label: Label, p: &Value) -> Result<Value> {
@@ -1418,7 +1473,7 @@ fn build() -> Vec<CommandSpec> {
                 Ok(json!({"items": ids.iter().map(|i| i.0).collect::<Vec<_>>()}))
             }
         ),
-        cmd!("file.import", "Import…", ["File"], Some("Cmd+I"), r#"{"paths":[str],"bin":binId?,"imageSequence":bool?,"replace":bool?}"#, always, |s, p| {
+        cmd!("file.import", "Import…", ["File"], Some("Cmd+I"), r#"{"paths":[str],"bin":binId?,"imageSequence":bool?,"replace":bool?,"background":bool?,"wait":bool?,"timeoutMs":u64?}"#, always, |s, p| {
             let bin = u64_p(p, "bin").map(filmcraft_project::BinId);
             let paths: Vec<String> = match p.get("paths").and_then(Value::as_array) {
                 Some(a) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
@@ -1430,6 +1485,10 @@ fn build() -> Vec<CommandSpec> {
             if bool_p(p, "replace").unwrap_or(false) {
                 let name = s.project.name.clone();
                 s.execute("file.newProject", json!({ "name": name }))?;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if bool_p(p, "background").unwrap_or(false) {
+                return crate::import_jobs::start(s, p, paths, bin);
             }
             if !bool_p(p, "imageSequence").unwrap_or(false) && paths.iter().any(|path| crate::media_browser::is_folder(&*s.services, path)) {
                 return crate::media_browser::import_paths(s, paths, bin.map(|b| b.0), false, "file.import");
@@ -1489,50 +1548,7 @@ fn build() -> Vec<CommandSpec> {
             if ids.is_empty() && sequences.is_empty() && reports.is_empty() && !errors.is_empty() {
                 return Err(EngineError::Other(errors.join("; ")));
             }
-            // Project Settings ▸ Ingest: copy / transcode / create proxies
-            // (image sequences are many files: ingest copies and transcodes single files only)
-            let item_ids: Vec<ItemId> = ids.iter().filter(|i| !image_sequences.iter().any(|q| q["item"].as_u64() == Some(**i))).map(|i| ItemId(*i)).collect();
-            // Settings ▸ Media Analysis & Transcription ▸ Automatically transcribe clips
-            let ma = &s.prefs.media_analysis;
-            if ma.auto_transcribe && ma.auto_transcribe_scope == "allImported" && !ids.is_empty() {
-                let audio: Vec<u64> = ids.iter().copied().filter(|i| s.project.item(ItemId(*i)).is_some_and(|it| it.has_audio())).collect();
-                if !audio.is_empty() {
-                    // without speech-to-text the setting can't act: say so instead of importing
-                    // silently untranscribed (#89)
-                    let r = crate::transcript::can_transcribe(s)
-                        .map_err(EngineError::Other)
-                        .and_then(|()| s.execute("transcript.generate", json!({"items": audio})));
-                    if let Err(e) = r {
-                        errors.push(format!("transcription: {e}"));
-                    }
-                }
-            }
-            let ingest = match crate::proxies::ingest(s, &item_ids) {
-                Ok(v) => v,
-                Err(e) => {
-                    errors.push(format!("ingest: {e}"));
-                    Value::Null
-                }
-            };
-            let mut out = if !ingest.is_null() {
-                json!({"items": ids, "sequences": sequences, "documents": reports, "errors": errors, "ingest": ingest})
-            } else if reports.is_empty() {
-                json!({"items": ids, "errors": errors})
-            } else {
-                json!({"items": ids, "sequences": sequences, "documents": reports, "errors": errors})
-            };
-            if !image_sequences.is_empty() {
-                out["imageSequences"] = json!(image_sequences);
-            }
-            // Newly imported files may resolve paths the project already listed as offline
-            // (issue #110): rebuild s.offline.missing so the "Media missing" badge clears, and drop
-            // the cached slate of every item that came back so the monitors show the file again.
-            let was_missing = s.offline.missing.clone();
-            crate::relink::refresh(s);
-            for item in was_missing.iter().filter(|i| !s.offline.missing.contains(i)) {
-                s.media.remove(*item);
-            }
-            Ok(out)
+            finish_import(s, ids, errors, sequences, reports, image_sequences)
         }),
         cmd!(
             "file.exportInterchange",
@@ -1705,6 +1721,7 @@ fn build() -> Vec<CommandSpec> {
             has_seq,
             crate::export_tools::export_media
         ),
+        query!("file.importStatus", "Import Status", r#"{"job":id?,"wait":bool?,"timeoutMs":u64?,"cancel":bool?}"#, crate::import_jobs::status),
         query!("jobs.list", "List Jobs", "{}", |s, _| Ok(Value::Array(s.jobs.iter().map(|j| crate::export_tools::job_json(s, j)).collect()))),
         query!("perf.stats", "Performance Statistics", "{}", |s, _| Ok(crate::perf::stats(s))),
         cmd!("jobs.cancel", "Cancel Job", [], None, r#"{"job":id}"#, always, |s, p| {

@@ -22,6 +22,7 @@ pub mod essential_sound;
 pub mod export_tools;
 pub mod graphic_templates;
 pub mod graphics;
+pub mod import_jobs;
 pub mod interchange;
 pub mod keyboard;
 mod keyframe_move;
@@ -481,6 +482,8 @@ pub struct Session {
     pub mask_jobs: Vec<masks::PendingTrack>,
     /// Scene Edit Detection jobs whose results are applied when they finish.
     pub scene_jobs: Vec<scene_detect::PendingScene>,
+    pub import_jobs: Vec<import_jobs::PendingImport>,
+    pub import_results: Vec<import_jobs::ImportOutcome>,
     /// Effect presets (built-in + the user's, persisted in the data directory).
     pub presets: presets::PresetLibrary,
     /// Export presets (built-in + the user's, persisted in the data directory) and favourites.
@@ -586,6 +589,8 @@ impl Session {
             media_jobs: Vec::new(),
             mask_jobs: Vec::new(),
             scene_jobs: Vec::new(),
+            import_jobs: Vec::new(),
+            import_results: Vec::new(),
             presets: Default::default(),
             export_presets: Default::default(),
             export_queue: Default::default(),
@@ -675,12 +680,18 @@ impl Session {
         p.last_sent = Some(cur);
     }
 
+    /// Drain committed imports once. Outcomes drained by `file.importStatus` are no longer available here.
+    pub fn take_import_outcomes(&mut self) -> Vec<import_jobs::ImportOutcome> {
+        std::mem::take(&mut self.import_results)
+    }
+
     /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the
     /// results of finished proxy / ingest jobs.
     pub fn poll_persistence(&mut self) {
         proxies::poll(self);
         masks::poll(self);
         scene_detect::poll(self);
+        import_jobs::poll(self);
         export_tools::pump_queue(self, false);
         panels::log_jobs(self);
         let Some(p) = self.persistence.as_mut() else { return };
@@ -1397,3 +1408,6 @@ mod source_placement_tests;
 mod frame_export_tests;
 #[cfg(test)]
 mod wasm_clock_tests;
+
+#[cfg(test)]
+mod import_jobs_tests;
