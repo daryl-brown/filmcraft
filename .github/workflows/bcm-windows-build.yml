@@ -105,7 +105,7 @@ jobs:
           . ./.github/scripts/ci-logged.ps1
           # Run all three so one failure does not hide the others' errors; fail at the end.
           $failed = @()
-          try { Invoke-Logged -Title 'cargo test engine package' -Command { cargo test --locked -p filmcraft-engine --lib --target $env:TARGET --message-format short -- audio_placement_tests settings_tests media_browser import_jobs_tests watchdog project_tools } } catch { $failed += "$_" }
+          try { Invoke-Logged -Title 'cargo test engine package' -Command { cargo test --locked -p filmcraft-engine --lib --target $env:TARGET --message-format short -- audio_placement_tests settings_tests media_browser import_jobs_tests watchdog project_tools media_open media_pool relink } } catch { $failed += "$_" }
           try { Invoke-Logged -Title 'cargo test render mixer' -Command { cargo test --locked -p filmcraft-render --lib --target $env:TARGET --message-format short -- mixer_tests } } catch { $failed += "$_" }
           try { Invoke-Logged -Title 'cargo test ui drop' -Command { cargo test --locked -p filmcraft-ui-egui --lib --target $env:TARGET --message-format short -- import_drop_tests } } catch { $failed += "$_" }
           if ($failed.Count -gt 0) { throw ($failed -join '; ') }
@@ -116,7 +116,7 @@ jobs:
           . ./.github/scripts/ci-logged.ps1
           $failed = @()
           try { Invoke-Logged -Title 'cargo test frame' -Command { cargo test --locked -p filmcraft-frame --lib --target $env:TARGET --message-format short } } catch { $failed += "$_" }
-          try { Invoke-Logged -Title 'cargo test ui source playback' -Command { cargo test --locked -p filmcraft-ui-egui --lib --target $env:TARGET --message-format short -- source_playback } } catch { $failed += "$_" }
+          try { Invoke-Logged -Title 'cargo test ui source playback' -Command { cargo test --locked -p filmcraft-ui-egui --lib --target $env:TARGET --message-format short -- source_playback peak_requests relink_job_tests } } catch { $failed += "$_" }
           try { Invoke-Logged -Title 'cargo test cli bench' -Command { cargo test --locked -p filmcraft-cli --bin filmcraft-cli --target $env:TARGET --message-format short -- bench } } catch { $failed += "$_" }
           if ($failed.Count -gt 0) { throw ($failed -join '; ') }
 
