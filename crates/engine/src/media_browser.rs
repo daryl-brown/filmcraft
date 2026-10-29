@@ -12,7 +12,7 @@
 //! | `mediaBrowser.favorite` | Add to / Remove from Favorites |
 //! | `mediaBrowser.clearRecent` | Clear Recent Directories |
 //! | `mediaBrowser.settings` | file types, view (list / thumbnails), columns (Edit Columns…), Import as Image Sequence, Hover Scrub, thumbnail size |
-//! | `mediaBrowser.import` | Import (the selection or `paths`; a folder becomes a bin, its sub-folders bins inside it; Project ▸ Ingest settings apply) |
+//! | `mediaBrowser.import` | Import (optional `background` and `openThreads`; the selection or `paths`; a folder becomes a bin, its sub-folders bins inside it; Project ▸ Ingest settings apply) |
 //! | `mediaBrowser.openInSource` | Open In Source Monitor (Shift+O) |
 //! | `mediaBrowser.probe` | a file's media properties (frame rate, duration, video / audio info), cached |
 //!
@@ -511,7 +511,7 @@ fn import_folder(s: &mut Session, folder: &Folder, parent: Option<u64>, out: &mu
     Ok(())
 }
 
-/// `mediaBrowser.import {paths?, bin?, imageSequence?}`: imports files. A folder becomes a bin
+/// `mediaBrowser.import {paths?, bin?, imageSequence?, background?, openThreads?}`: imports files. A folder becomes a bin
 /// named after it (in `bin`) holding its files, and each sub-folder a bin inside that, as in
 /// Premiere; the result then also lists the new `bins`. Import as Image Sequence takes the first
 /// file instead.
@@ -522,6 +522,16 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let seq = bool_p(p, "imageSequence").unwrap_or(s.prefs.media_browser.import_as_image_sequence);
     let bin = u64_p(p, "bin");
+    if bool_p(p, "background").unwrap_or(false) && !seq {
+        let mut q = json!({"paths": paths, "imageSequence": false, "background": true});
+        if let Some(b) = bin {
+            q["bin"] = json!(b);
+        }
+        if let Some(n) = p.get("openThreads") {
+            q["openThreads"] = n.clone();
+        }
+        return s.execute("file.import", q);
+    }
     import_paths(s, paths, bin, seq, "mediaBrowser.import")
 }
 
@@ -724,7 +734,7 @@ pub(crate) fn commands() -> Vec<CommandSpec> {
             r#"{"fileTypes":"all|video|audio|image|project|caption|<ext>"?,"view":"list|thumbnails"?,"columns":[str]?,"importAsImageSequence":bool?,"hoverScrub":bool?,"thumbnailSize":f32?}"#,
             settings,
         ),
-        c("mediaBrowser.import", "Import", r#"{"paths":[str]?,"bin":binId?,"imageSequence":bool?}"#, import),
+        c("mediaBrowser.import", "Import", r#"{"paths":[str]?,"bin":binId?,"imageSequence":bool?,"background":bool?,"openThreads":int?}"#, import),
         CommandSpec {
             id: "mediaBrowser.openInSource",
             label: "Open In Source Monitor",

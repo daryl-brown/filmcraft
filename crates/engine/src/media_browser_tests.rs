@@ -464,3 +464,21 @@ fn empty_folder_does_not_hide_an_explicit_file() {
     assert_eq!(r["skipped"], 2);
     assert_eq!(r["errors"], json!(["no media files in /sidecars"]));
 }
+
+#[test]
+fn browser_background_image_sequence_stays_synchronous() {
+    let fs = folder_fixture();
+    {
+        let mut files = fs.files.lock().unwrap();
+        let png = files.get("/root/B/b1.png").unwrap().clone();
+        files.insert("/root/B/b2.png".into(), png);
+    }
+    let mut s = Session::new(Arc::new(fs));
+    let out = s.execute("mediaBrowser.import", json!({
+        "paths": ["/root/B/b1.png"], "imageSequence": true, "background": true, "openThreads": 4,
+    })).unwrap();
+    assert!(out.get("job").is_none());
+    assert!(out.get("pending").is_none());
+    assert_eq!(out["items"].as_array().unwrap().len(), 1);
+    assert_eq!(out["imageSequences"][0]["frames"], 2);
+}

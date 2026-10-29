@@ -761,6 +761,9 @@ fn media_browser_navigation_import_and_columns() {
     d.ok("ui.scroll", json!({"id": "panel.menu.scroll", "dy": -1200}));
     d.frames(4);
     d.click("mediaBrowser.menu.import");
+    let params = &d.app().session.journal.iter().rev().find(|(id, _)| id == "mediaBrowser.import").unwrap().1;
+    assert_eq!(params["background"], true);
+    d.exec("file.importStatus", json!({"wait": true, "timeoutMs": 30_000}));
     assert_eq!(d.app().session.project.items.len(), 2);
     // Shift+O opens the selection in the Source monitor (already imported: no duplicate)
     d.click("mediaBrowser.entry.b-roll.wav");

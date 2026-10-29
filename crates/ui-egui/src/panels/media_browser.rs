@@ -352,7 +352,7 @@ fn node(
             ui.close();
         }
         if ui.button(tl!("Import")).clicked() {
-            exec(app, ctx, "mediaBrowser.import", json!({"paths": [path]}));
+            exec(app, ctx, "mediaBrowser.import", json!({"paths": [path], "background": true}));
             ui.close();
         }
         if section == "recent" && ui.button(tl!("Clear Recent Directories")).clicked() {
@@ -418,7 +418,7 @@ fn entry_interactions(app: &mut FilmcraftApp, ui: &egui::Ui, resp: &egui::Respon
         let b = ui.button(tl!("Import"));
         app.auto.add("mediaBrowser.entryMenu.import", b.rect, "Import");
         if b.clicked() {
-            exec(app, &ctx, "mediaBrowser.import", json!({"paths": paths, "imageSequence": false}));
+            exec(app, &ctx, "mediaBrowser.import", json!({"paths": paths, "imageSequence": false, "background": true}));
             ui.close();
         }
         if !e.is_dir {
@@ -461,6 +461,7 @@ fn start_file_drag(app: &mut FilmcraftApp, ui: &egui::Ui, e: &Entry) {
     let before = app.session.history.undo.len();
     let mut items: Vec<u64> = Vec::new();
     if !fresh.is_empty() {
+        // The drag needs item ids immediately, so this import stays synchronous.
         let Ok(r) = app.session.execute("mediaBrowser.import", json!({"paths": fresh})) else { return };
         items = r["items"].as_array().map(|a| a.iter().filter_map(Value::as_u64).collect()).unwrap_or_default();
     }
@@ -803,7 +804,7 @@ pub fn panel_menu(app: &mut FilmcraftApp, ui: &mut egui::Ui) -> bool {
         close = true;
     }
     if item(app, ui, "import", tl!("Import"), has_sel, None, "") {
-        exec(app, &ctx, "mediaBrowser.import", json!({}));
+        exec(app, &ctx, "mediaBrowser.import", json!({"background": true}));
         close = true;
     }
     if item(app, ui, "openInSource", tl!("Open In Source Monitor"), has_sel, None, "Shift+O") {
