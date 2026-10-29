@@ -381,10 +381,10 @@ fn imported_mono_breakout_survives_project_save_and_open() {
 fn import_maps_only_stream_zero_and_keeps_later_stream_layouts() {
     use filmcraft_isobmff::{Brand, Mp4Writer, PcmConfig, SampleEntry, TrackConfig, WriteSample, WriterOptions};
     let mut mux = Mp4Writer::new(std::io::Cursor::new(Vec::new()), WriterOptions::new(Brand::Mov)).unwrap();
-    for channels in [4u16, 2] {
+    for channels in [4u32, 2] {
         let entry = SampleEntry::pcm(PcmConfig { bits: 16, float: false, big_endian: false, signed: true, channels, sample_rate: 48_000.0 });
         let track = mux.add_track(TrackConfig::new(entry, 48_000)).unwrap();
-        let data = vec![0u8; 4800 * usize::from(channels) * 2];
+        let data = vec![0u8; 4800 * usize::try_from(channels).unwrap() * 2];
         mux.write_sample(track, WriteSample { data: &data, duration: 4800, composition_offset: 0, is_sync: true }).unwrap();
     }
     let mut s = Session::default();
