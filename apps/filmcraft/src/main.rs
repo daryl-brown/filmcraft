@@ -117,6 +117,27 @@ fn main() -> eframe::Result {
             }
         }
     }
+    filmcraft_engine::watchdog::watch_current_thread();
+    let stall_ms = std::env::var("FILMCRAFT_STALL_MS").ok();
+    let _watchdog = filmcraft_engine::watchdog::threshold_from_env(stall_ms.as_deref(), Some(std::time::Duration::from_millis(2000)))
+        .and_then(|threshold| {
+            use filmcraft_engine::watchdog::{self, ReportKind};
+            match watchdog::start(watchdog::Monitor::global(), watchdog::Config::new(threshold), Arc::new(|report| {
+                match report.kind {
+                    ReportKind::Stalled | ReportKind::StillStalled => log::warn!(target: "filmcraft_engine::watchdog", "{report}"),
+                    ReportKind::Recovered => log::info!(target: "filmcraft_engine::watchdog", "{report}"),
+                }
+            })) {
+                Ok(handle) => {
+                    log::info!("stall watchdog on: threshold {} ms", threshold.as_millis());
+                    Some(handle)
+                }
+                Err(error) => {
+                    log::warn!("could not start stall watchdog: {error}");
+                    None
+                }
+            }
+        });
     app_nap::disable();
     #[cfg(target_os = "linux")]
     dev_icon::ensure_dev_desktop_entry();
