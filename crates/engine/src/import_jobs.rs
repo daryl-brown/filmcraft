@@ -68,14 +68,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub const OPEN_CONCURRENCY: usize = 4;
 
 #[cfg(not(target_arch = "wasm32"))]
-fn open_limit(p: &Value, environment: Option<&str>) -> usize {
+pub(crate) fn open_limit(p: &Value, environment: Option<&str>) -> usize {
     let integer = |v: &Value| v.as_i64().map(|n| n.clamp(1, 16) as usize).or_else(|| v.as_u64().map(|n| n.clamp(1, 16) as usize));
     p.get("openThreads").and_then(integer)
         .or_else(|| environment.and_then(|v| v.parse::<i64>().ok()).map(|n| n.clamp(1, 16) as usize))
         .unwrap_or(OPEN_CONCURRENCY)
 }
 
-fn current_status(current: &[(usize, String, web_time::Instant)]) -> Option<String> {
+pub(crate) fn current_status(current: &[(usize, String, web_time::Instant)]) -> Option<String> {
     let (_, name, began) = current.iter().min_by_key(|(_, _, began)| *began)?;
     let mut status = format!("{name} ({} s)", began.elapsed().as_secs());
     if current.len() > 1 {
@@ -416,6 +416,7 @@ pub(crate) fn status(s: &mut Session, p: &Value) -> Result<Value> {
         }
     }
     poll(s);
+    crate::media_open::poll(s);
     let jobs: Vec<Value> = s.jobs.iter().filter(matches).map(|j| json!({
         "id": j.id, "label": j.label, "status": lock(&j.progress.status).clone(),
         "done": j.progress.done.load(Ordering::Relaxed), "total": j.progress.total.load(Ordering::Relaxed),

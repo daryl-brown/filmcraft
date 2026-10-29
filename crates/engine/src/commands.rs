@@ -1620,9 +1620,16 @@ fn build() -> Vec<CommandSpec> {
             }
             Ok(r)
         }),
-        cmd!("file.open", "Open Project…", ["File"], Some("Cmd+O"), r#"{"path":str}"#, always, |s, p| {
+        cmd!("file.open", "Open Project…", ["File"], Some("Cmd+O"), r#"{"path":str,"warm":bool?}"#, always, |s, p| {
             let path = str_p(p, "path").ok_or_else(|| bad("file.open", "need `path`"))?.to_string();
-            open_project(s, &path)
+            let mut out = open_project(s, &path)?;
+            if bool_p(p, "warm").unwrap_or(false) {
+                match s.execute("media.openInBackground", json!({"scope": "openSequences"})) {
+                    Ok(warm) => out["warm"] = warm,
+                    Err(error) => s.error_toast("media.openInBackground", error.to_string()),
+                }
+            }
+            Ok(out)
         }),
         cmd!("file.recover", "Recover Unsaved Changes…", ["File"], None, r#"{"id":str?}"#, has_recovery, |s, p| recover(s, str_p(p, "id"))),
         cmd!("file.discardRecovery", "Discard Unsaved Changes", [], None, r#"{"id":str?,"all":bool?}"#, has_recovery, |s, p| {
@@ -1721,6 +1728,8 @@ fn build() -> Vec<CommandSpec> {
             has_seq,
             crate::export_tools::export_media
         ),
+        query!("media.openInBackground", "Open Media in Background",
+            r#"{"items":[id]?,"scope":"openSequences|all"?,"openThreads":int?}"#, crate::media_open::start),
         query!("file.importStatus", "Import Status", r#"{"job":id?,"wait":bool?,"timeoutMs":u64?,"cancel":bool?}"#, crate::import_jobs::status),
         query!("jobs.list", "List Jobs", "{}", |s, _| Ok(Value::Array(s.jobs.iter().map(|j| crate::export_tools::job_json(s, j)).collect()))),
         query!("perf.stats", "Performance Statistics", "{}", |s, _| Ok(crate::perf::stats(s))),
@@ -4701,6 +4710,7 @@ fn schema_backup_path(path: &str, schema: u32) -> String {
 
 /// Make `proj` the session's project (fresh history, media pool and editor state).
 fn install_project(s: &mut Session, proj: filmcraft_project::Project, path: Option<String>, clean: bool) {
+    crate::media_open::reset(s);
     let proxies = s.media.use_proxies();
     s.media = std::sync::Arc::new(crate::MediaPool::default());
     s.media.set_use_proxies(proxies);

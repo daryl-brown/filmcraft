@@ -302,23 +302,30 @@ impl MediaPool {
 
     /// Resolve (and cache) the source for a project item, using proxies when they are enabled.
     pub fn source_for(&self, p: &Project, item: ItemId, services: &dyn Services) -> Option<SharedSource> {
-        self.resolve(p, item, services, self.use_proxies())
+        self.resolve(p, item, Some(services), self.use_proxies())
     }
 
     /// Resolve the full-resolution source for an item (never a proxy).
     pub fn full_res_source(&self, p: &Project, item: ItemId, services: &dyn Services) -> Option<SharedSource> {
-        self.resolve(p, item, services, false)
+        self.resolve(p, item, Some(services), false)
     }
 
-    fn resolve(&self, p: &Project, item: ItemId, services: &dyn Services, proxies: bool) -> Option<SharedSource> {
+    /// Resolve only sources that need no file access, respecting proxy and reference keys.
+    pub fn cached_source(&self, p: &Project, item: ItemId) -> Option<SharedSource> {
+        self.resolve(p, item, None, self.use_proxies())
+    }
+
+    fn resolve(&self, p: &Project, item: ItemId, services: Option<&dyn Services>, proxies: bool) -> Option<SharedSource> {
         let (item, m, _) = p.resolve_media(item)?;
         let it = p.item(item)?;
         if proxies
             && !m.offline
             && let Some(MediaRef::File { path }) = &m.proxy
-            && let Some(s) = self.proxy_source(item, path, m, services)
         {
-            return Some(s);
+            if let Some(s) = self.proxy_source(item, path, m, services) {
+                return Some(s);
+            }
+            services?;
         }
         let key = media_key(m);
         if let Some((k, s)) = self.sources.read().unwrap_or_else(PoisonError::into_inner).get(&item)
@@ -336,29 +343,32 @@ impl MediaPool {
                 self.set_offline(item, OfflineReason::MadeOffline, path, "made offline");
                 Arc::new(SlateSource::new(m.info.clone(), &file_name(path), OfflineReason::MadeOffline))
             }
-            MediaRef::File { path } => match self.follow_media(path).and_then(|file| {
-                if m.info.kind == filmcraft_media::MediaKind::ImageSequence {
-                    let _scope = crate::watchdog::scope("media.open", path);
-                    open_image_sequence(&file, services, m.info.frame_rate(), &it.name)
-                } else {
-                    self.open_file(&file, services)
+            MediaRef::File { path } => {
+                let services = services?;
+                match self.follow_media(path).and_then(|file| {
+                    if m.info.kind == filmcraft_media::MediaKind::ImageSequence {
+                        let _scope = crate::watchdog::scope("media.open", path);
+                        open_image_sequence(&file, services, m.info.frame_rate(), &it.name)
+                    } else {
+                        self.open_file(&file, services)
+                    }
+                }) {
+                    Ok(s) => {
+                        self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
+                        self.unsupported_as_slate(item, path, s)
+                    }
+                    Err(_) if filmcraft_media::pending::is_set() => {
+                        // the host is still fetching the file's bytes: show the slate for now, retry later
+                        return Some(Arc::new(SlateSource::new(m.info.clone(), &file_name(path), OfflineReason::Missing)));
+                    }
+                    Err(e) => {
+                        log::warn!("media offline: {path}: {e}");
+                        let reason = if matches!(e, MediaError::Offline(_)) { OfflineReason::Missing } else { OfflineReason::Unreadable };
+                        self.set_offline(item, reason, path, &e.to_string());
+                        Arc::new(SlateSource::new(m.info.clone(), &file_name(path), reason))
+                    }
                 }
-            }) {
-                Ok(s) => {
-                    self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
-                    self.unsupported_as_slate(item, path, s)
-                }
-                Err(_) if filmcraft_media::pending::is_set() => {
-                    // the host is still fetching the file's bytes: show the slate for now, retry later
-                    return Some(Arc::new(SlateSource::new(m.info.clone(), &file_name(path), OfflineReason::Missing)));
-                }
-                Err(e) => {
-                    log::warn!("media offline: {path}: {e}");
-                    let reason = if matches!(e, MediaError::Offline(_)) { OfflineReason::Missing } else { OfflineReason::Unreadable };
-                    self.set_offline(item, reason, path, &e.to_string());
-                    Arc::new(SlateSource::new(m.info.clone(), &file_name(path), reason))
-                }
-            },
+            }
         };
         self.sources.write().unwrap_or_else(PoisonError::into_inner).insert(item, (key, src.clone()));
         Some(src)
@@ -368,13 +378,14 @@ impl MediaPool {
         self.offline.write().unwrap_or_else(PoisonError::into_inner).insert(item, OfflineStatus { reason, path: path.to_string(), error: error.to_string() });
     }
 
-    fn proxy_source(&self, item: ItemId, path: &str, m: &MediaClip, services: &dyn Services) -> Option<SharedSource> {
+    fn proxy_source(&self, item: ItemId, path: &str, m: &MediaClip, services: Option<&dyn Services>) -> Option<SharedSource> {
         let key = format!("proxy:{path}");
         if let Some((k, s)) = self.proxies.read().unwrap_or_else(PoisonError::into_inner).get(&item)
             && *k == key
         {
             return Some(s.clone());
         }
+        let services = services?;
         match self.follow_media(path).and_then(|file| self.open_file(&file, services)) {
             Ok(s) => {
                 // a proxy with fewer audio streams than the original (say one track of an OBS

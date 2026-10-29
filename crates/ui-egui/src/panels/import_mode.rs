@@ -109,7 +109,7 @@ fn recent(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, y: f32) -> f32 
     }
     if let Some(path) = open {
         let ctx = ui.ctx().clone();
-        if crate::menus::invoke(app, &ctx, "file.open", json!({"path": path})).is_ok() {
+        if crate::menus::invoke(app, &ctx, "file.open", json!({"path": path, "warm": true})).is_ok() {
             app.ui.mode = crate::state::Mode::Edit;
         }
     }

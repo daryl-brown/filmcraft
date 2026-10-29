@@ -128,6 +128,10 @@ mod native {
             self.fs.read_file(path)
         }
 
+        fn file_size(&self, path: &str) -> std::io::Result<u64> {
+            self.fs.file_size(path)
+        }
+
         fn write_file(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
             self.fs.write_file(path, bytes)
         }
@@ -557,6 +561,212 @@ mod native {
         assert!(s.take_import_outcomes().is_empty());
         assert_eq!(s.execute("file.importStatus", json!({})).unwrap()["outcomes"], json!([]));
     }
+
+    // Construct saved media metadata without touching the gated filesystem.
+    fn saved_items(s: &mut Session, paths: &[String], used: usize) -> Vec<ItemId> {
+        use filmcraft_project::{ItemKind, Label, MediaClip};
+        let wav = filmcraft_media::wav::write_wav16(&[0.0; 48_000], 2, 48_000);
+        let source = crate::MediaPool::default().open_bytes("clip.wav", wav.into()).unwrap();
+        let p = Arc::make_mut(&mut s.project);
+        let ids: Vec<_> = paths.iter().map(|path| p.add_item(path, Label::Iris, ItemKind::Media(Box::new(MediaClip {
+            media: MediaRef::File { path: path.clone() }, info: source.info().clone(), interpret: Default::default(),
+            mark_in: None, mark_out: None, markers: Vec::new(), offline: false, proxy: None, identity: None,
+        })), None)).collect();
+        s.execute("file.newSequence", json!({"width": 16, "height": 16})).unwrap();
+        for (n, id) in ids.iter().take(used).enumerate() {
+            s.execute("timeline.place", json!({"item": id.0, "track": "A1", "seconds": n})).unwrap();
+        }
+        ids
+    }
+
+    #[test]
+    fn project_media_open_returns_while_gated_and_status_waits_without_import_outcomes() {
+        let (mut s, gate) = gated();
+        let ids = saved_items(&mut s, &["/outside.wav".into()], 1);
+        let before = s.project.clone();
+        let undo = s.undo_mark();
+        let began = Instant::now();
+        let out = s.execute("media.openInBackground", json!({})).unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert_eq!(out["files"], 1);
+        let job = out["job"].as_u64().unwrap();
+        gate.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(s.execute("file.importStatus", json!({"job": job})).unwrap()["pending"], 1);
+        assert!(s.media.cached_source(&s.project, ids[0]).is_none());
+        gate.release.send(()).unwrap();
+        let status = wait(&mut s, job);
+        assert_eq!(status["outcomes"], json!([]));
+        assert!(s.media.cached_source(&s.project, ids[0]).is_some());
+        assert!(s.opening_items.is_empty());
+        assert_eq!(s.undo_mark(), undo);
+        assert_eq!(*s.project, *before);
+    }
+
+    #[test]
+    fn project_media_scope_concurrency_and_cancel_keep_cached_files() {
+        for (scope, expected) in [(None, 2), (Some("all"), 3)] {
+            let (mut s, fs, paths) = pool_fixture(3, 0);
+            let ids = saved_items(&mut s, &paths, 2);
+            let mut params = json!({"openThreads": 2});
+            if let Some(scope) = scope {
+                params["scope"] = json!(scope);
+            }
+            let out = s.execute("media.openInBackground", params).unwrap();
+            assert_eq!(out["files"], expected);
+            fs.wait_for(2);
+            fs.release();
+            wait(&mut s, out["job"].as_u64().unwrap());
+            let state = fs.state.lock().unwrap();
+            assert_eq!(state.entered, expected as usize);
+            assert_eq!(state.maximum, 2);
+            assert!(ids.iter().take(expected as usize).all(|id| s.media.cached_source(&s.project, *id).is_some()));
+        }
+        let (mut s, fs, paths) = pool_fixture(8, 0);
+        let ids = saved_items(&mut s, &paths, 0);
+        let out = s.execute("media.openInBackground", json!({"scope": "all", "openThreads": 2})).unwrap();
+        let job = out["job"].as_u64().unwrap();
+        fs.wait_for(2);
+        let status = s.execute("file.importStatus", json!({"job": job, "cancel": true})).unwrap();
+        assert!(status["jobs"][0]["status"].as_str().unwrap().contains("2 files in progress"));
+        fs.release();
+        wait(&mut s, job);
+        assert_eq!(fs.state.lock().unwrap().entered, 2);
+        assert_eq!(ids.iter().filter(|id| s.media.cached_source(&s.project, **id).is_some()).count(), 2);
+    }
+
+    #[test]
+    fn project_media_follows_nested_sequences_and_cached_reference_keys() {
+        let (mut s, fs, paths) = pool_fixture(3, 1);
+        let ids = saved_items(&mut s, &paths, 2);
+        let inner = s.state.active_sequence.unwrap();
+        let project = Arc::make_mut(&mut s.project);
+        let mut clip = project.sequence(inner).unwrap().audio_tracks[0].items[0].clone();
+        clip.item = inner;
+        let outer = project.new_sequence("Outer", Default::default(), 1, 1, None);
+        project.sequence_mut(outer).unwrap().audio_tracks[0].items.push(clip);
+        s.state.open_sequences = vec![outer];
+        let out = s.execute("media.openInBackground", json!({})).unwrap();
+        assert_eq!(out["files"], 2);
+        wait(&mut s, out["job"].as_u64().unwrap());
+        assert_eq!(fs.state.lock().unwrap().entered, 2);
+        assert!(s.media.cached_source(&s.project, ids[0]).is_some());
+        let project = Arc::make_mut(&mut s.project);
+        project.item_mut(ids[0]).unwrap().as_media_mut().unwrap().media = MediaRef::File { path: paths[2].clone() };
+        assert!(s.media.cached_source(&s.project, ids[0]).is_none(), "a stale reference is never returned");
+        let project = Arc::make_mut(&mut s.project);
+        project.item_mut(ids[1]).unwrap().as_media_mut().unwrap().proxy = Some(MediaRef::File { path: paths[2].clone() });
+        s.media.set_use_proxies(true);
+        assert!(s.media.cached_source(&s.project, ids[1]).is_none(), "an unopened preferred proxy is a miss");
+        assert_eq!(fs.state.lock().unwrap().entered, 2);
+        let out = s.execute("media.openInBackground", json!({"items": [ids[1].0]})).unwrap();
+        wait(&mut s, out["job"].as_u64().unwrap());
+        assert!(s.media.cached_source(&s.project, ids[1]).is_some());
+    }
+
+    #[test]
+    fn cached_lookup_never_opens_and_requests_are_coalesced() {
+        let (mut s, fs, paths) = pool_fixture(1, 0);
+        let ids = saved_items(&mut s, &paths, 0);
+        assert!(s.media.cached_source(&s.project, ids[0]).is_none());
+        assert_eq!(fs.state.lock().unwrap().entered, 0);
+        let began = Instant::now();
+        for _ in 0..20 {
+            assert!(s.source_if_open(ids[0]).is_none());
+        }
+        assert!(began.elapsed() < Duration::from_secs(5));
+        fs.wait_for(1);
+        assert_eq!(s.jobs.len(), 1);
+        assert_eq!(fs.state.lock().unwrap().entered, 1);
+        fs.release();
+        let job = s.jobs[0].id;
+        wait(&mut s, job);
+        assert!(s.source_if_open(ids[0]).is_some());
+    }
+
+    #[test]
+    fn project_media_counts_skips_and_creates_no_empty_job() {
+        let (mut s, fs, paths) = pool_fixture(6, 1);
+        let ids = saved_items(&mut s, &paths, 0);
+        let source = crate::MediaPool::default().open_file(&paths[0], &fs.fs).unwrap();
+        s.media.insert_file(ids[0], &paths[0], source);
+        let project = Arc::make_mut(&mut s.project);
+        project.item_mut(ids[1]).unwrap().as_media_mut().unwrap().media = MediaRef::Generator(filmcraft_media::Generator::ColorMatte { color: [0.0; 4] });
+        project.item_mut(ids[2]).unwrap().as_media_mut().unwrap().offline = true;
+        project.item_mut(ids[3]).unwrap().as_media_mut().unwrap().media = MediaRef::File { path: "/missing.wav".into() };
+        project.item_mut(ids[4]).unwrap().as_media_mut().unwrap().info.kind = filmcraft_media::MediaKind::ImageSequence;
+        let out = s.execute("media.openInBackground", json!({"scope": "all"})).unwrap();
+        assert_eq!(out["files"], 1);
+        assert_eq!(out["skipped"], 5);
+        wait(&mut s, out["job"].as_u64().unwrap());
+        let out = s.execute("media.openInBackground", json!({"scope": "all"})).unwrap();
+        assert_eq!(out, json!({"job": null, "pending": false, "files": 0, "skipped": 6}));
+        assert_eq!(s.jobs.len(), 1);
+        assert_eq!(fs.state.lock().unwrap().entered, 1);
+        assert!(s.media.cached_source(&s.project, ids[1]).is_some());
+        assert!(s.media.cached_source(&s.project, ids[2]).is_some());
+    }
+
+    #[test]
+    fn failed_source_requests_retry_after_the_cooldown() {
+        let (mut s, fs, paths) = pool_fixture(1, 1);
+        let ids = saved_items(&mut s, &paths, 0);
+        fs.fs.files.lock().unwrap().insert(paths[0].clone(), vec![1, 2, 3]);
+        assert!(s.source_if_open(ids[0]).is_none());
+        let job = s.jobs[0].id;
+        wait(&mut s, job);
+        assert!(s.source_if_open(ids[0]).is_none());
+        assert_eq!(s.jobs.len(), 1);
+        s.opening_times.insert(ids[0], web_time::Instant::now() - Duration::from_secs(5));
+        assert!(s.source_if_open(ids[0]).is_none());
+        let job = s.jobs[1].id;
+        wait(&mut s, job);
+        assert_eq!(fs.state.lock().unwrap().entered, 2);
+    }
+
+    #[test]
+    fn warm_project_open_is_optional_and_returns_before_media_open() {
+        let path = std::env::temp_dir().join("filmcraft-warm.wav").to_string_lossy().into_owned();
+        let document = std::env::temp_dir().join("filmcraft-warm.fcproj").to_string_lossy().into_owned();
+        let fs = folder_fixture();
+        let wav = fs.files.lock().unwrap().get("/outside.wav").unwrap().clone();
+        fs.files.lock().unwrap().insert(path.clone(), wav);
+        let (release, receive) = mpsc::channel();
+        let (entered, ready) = mpsc::channel();
+        let services = Arc::new(GateFs { fs, gate: Mutex::new(Some(receive)), entered, path: path.clone() });
+        let gate = Gate { release, entered: ready };
+        let mut s = Session::new(services);
+        let ids = saved_items(&mut s, &[path], 1);
+        s.execute("file.saveAs", json!({"path": document})).unwrap();
+        let out = s.execute("file.open", json!({"path": document})).unwrap();
+        assert!(out.get("warm").is_none());
+        assert!(s.jobs.is_empty());
+        assert!(gate.entered.try_recv().is_err());
+        let began = Instant::now();
+        let out = s.execute("file.open", json!({"path": document, "warm": true})).unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        let job = out["warm"]["job"].as_u64().unwrap();
+        gate.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        gate.release.send(()).unwrap();
+        wait(&mut s, job);
+        assert!(s.media.cached_source(&s.project, ids[0]).is_some());
+    }
+
+    #[test]
+    fn project_media_rejects_hostile_parameters_and_contains_panics() {
+        let (mut s, fs, paths) = pool_fixture(1, 1);
+        let ids = saved_items(&mut s, &paths, 0);
+        for params in [json!({"items": true}), json!({"items": [-1]}), json!({"items": [null]}), json!({"scope": "unknown"})] {
+            assert!(s.execute("media.openInBackground", params).is_err());
+        }
+        let project = Arc::make_mut(&mut s.project);
+        project.item_mut(ids[0]).unwrap().as_media_mut().unwrap().media = MediaRef::File { path: "/panic.wav".into() };
+        fs.fs.files.lock().unwrap().insert("/panic.wav".into(), vec![0]);
+        let out = s.execute("media.openInBackground", json!({"items": [ids[0].0]})).unwrap();
+        let status = wait(&mut s, out["job"].as_u64().unwrap());
+        assert_eq!(status["jobs"][0]["done"], 1);
+        assert!(s.opening_items.is_empty());
+    }
+
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -570,4 +780,14 @@ fn wasm_ignores_background_import() {
     let out = s.execute("file.import", json!({"paths": ["/outside.wav"], "background": true})).unwrap();
     assert!(out.get("job").is_none());
     assert_eq!(s.project.items.len(), 1);
+}
+
+#[cfg(target_arch = "wasm32")]
+#[test]
+fn wasm_background_project_media_is_a_no_op() {
+    let mut s = crate::Session::default();
+    let out = s.execute("media.openInBackground", serde_json::json!({"scope": "all"})).unwrap();
+    assert_eq!(out, serde_json::json!({"job": null, "pending": false, "files": 0, "skipped": 0}));
+    s.request_open(filmcraft_project::ItemId(1));
+    assert!(s.jobs.is_empty());
 }

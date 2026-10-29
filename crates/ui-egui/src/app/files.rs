@@ -69,7 +69,7 @@ impl FilmcraftApp {
             }
             "file.open" => self.pick(FileDialog::OpenProject, |app, paths| {
                 let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
-                app.session.execute("file.open", json!({"path": path})).map_err(|e| e.to_string())
+                app.session.execute("file.open", json!({"path": path, "warm": true})).map_err(|e| e.to_string())
             }),
             "graphics.newFromFile" => {
                 let exts: Vec<&str> = filmcraft_media::STILL_EXTENSIONS.iter().chain(filmcraft_media::VIDEO_EXTENSIONS).copied().collect();
