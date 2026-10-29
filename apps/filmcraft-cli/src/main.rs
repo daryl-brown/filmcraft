@@ -409,7 +409,7 @@ async fn cli_bench_decode(a: &Args) {
     outln!("{n} frames in {dt:.2}s, {:.1} fps, {workers} workers", n as f64 / dt.max(f64::MIN_POSITIVE));
     let first = samples.iter().min_by_key(|s| s.0).map(|s| s.1).unwrap_or_default();
     samples.sort_unstable_by_key(|s| s.1);
-    let ms = |i| samples.get(i).map(|s| s.1.as_secs_f64() * 1000.0).unwrap_or_default();
+    let ms = |i: usize| samples.get(i).map(|s| s.1.as_secs_f64() * 1000.0).unwrap_or_default();
     let middle = samples.len() / 2;
     let median = if samples.len() % 2 == 0 { (ms(middle - 1) + ms(middle)) / 2.0 } else { ms(middle) };
     outln!("request latency ms: first {:.1}, min {:.1}, median {median:.1}, max {:.1}", first.as_secs_f64() * 1000.0, ms(0), ms(samples.len().saturating_sub(1)));
