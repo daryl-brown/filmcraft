@@ -78,3 +78,66 @@ fn parallel_matches_sequential_in_draft_mode() {
         equal(&reference, &actual, &format!("{name} draft"));
     }
 }
+
+const INTRA_S8: &[&str] = &["h422_10_s8_cabac", "h422_10_s8_cavlc", "h10_s8_cabac"];
+
+#[test]
+fn intra_fixtures_are_detected_and_inter_ones_are_not() {
+    for &name in INTRA_S8.iter().chain(["high_720p", "keyint10", "cavlc_b", "baseline_qcif"].iter()) {
+        let Some((path, _)) = common::ensure(common::fixture(name)) else { continue };
+        let data = std::fs::read(path).unwrap();
+        let aus = common::split_access_units(&data);
+        assert!(!aus.is_empty(), "{name}");
+        for (i, au) in aus.into_iter().enumerate() {
+            assert_eq!(filmcraft_h264::stream_is_intra_annexb(au), INTRA_S8.contains(&name), "{name} access unit {i}");
+        }
+    }
+}
+
+#[test]
+fn intra_only_decoder_rejects_inter_pictures() {
+    let Some((path, _)) = common::ensure(common::fixture("keyint10")) else { return };
+    let data = std::fs::read(path).unwrap();
+    let aus = common::split_access_units(&data);
+    assert!(aus.len() > 1);
+    let mut decoder = Decoder::with_threads(1);
+    decoder.set_intra_only(true);
+    decoder.decode(aus[0], 0).unwrap();
+    assert!(matches!(decoder.decode(aus[1], 1), Err(filmcraft_h264::Error::Invalid(_))));
+}
+
+#[test]
+fn shared_pool_decoders_match_default_on_intra_fixtures() {
+    for &name in INTRA_S8 {
+        let fixture = common::fixture(name);
+        let Some((path, yuv)) = common::ensure(fixture) else { continue };
+        let data = std::fs::read(&path).unwrap();
+        let mut pictures = Vec::new();
+        let mut parallel = 0;
+        for (i, au) in common::split_access_units(&data).into_iter().enumerate() {
+            let mut decoder = Decoder::with_shared_pool();
+            decoder.set_intra_only(true);
+            pictures.extend(decoder.decode(au, i as i64).unwrap());
+            pictures.extend(decoder.flush());
+            assert!(decoder.take_error().is_none(), "{name} access unit {i}");
+            parallel += decoder.stats().slice_parallel_pictures;
+        }
+        common::compare(&pictures, &std::fs::read(yuv).unwrap(), fixture.width as usize, fixture.height as usize).unwrap();
+        let (default, _) = common::decode_file_with(&path, 1, false, false).unwrap();
+        equal(&default, &pictures, name);
+        if filmcraft_h264::default_threads() > 1 {
+            assert!(parallel > 0, "{name}");
+        } else {
+            assert_eq!(parallel, 0, "{name}: only one worker available");
+        }
+    }
+}
+
+#[test]
+fn mid_row_slices_use_sequential_path() {
+    let Some((path, _)) = common::ensure(common::fixture("h422_10_slicemax")) else { return };
+    let (reference, _) = common::decode_file_with(&path, 1, false, false).unwrap();
+    let (actual, stats) = common::decode_file_with(&path, 4, true, false).unwrap();
+    equal(&reference, &actual, "mid-row slices");
+    assert_eq!(stats.slice_parallel_pictures, 0);
+}
