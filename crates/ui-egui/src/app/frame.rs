@@ -104,6 +104,12 @@ impl FilmcraftApp {
                 ctx.request_repaint();
             }
         }
+        for job in self.pending_relinks.clone() {
+            if let Some(outcome) = self.session.take_command_outcome(job) {
+                complete_relink(&mut self.pending_relinks, &mut self.ui.status, outcome);
+                ctx.request_repaint();
+            }
+        }
         let running = self.session.jobs.iter().rev().find(|j| !j.progress.finished.load(Ordering::Relaxed)).cloned();
         // Play after rendering previews.
         if let Some((id, from)) = self.watched_render
@@ -233,5 +239,32 @@ impl FilmcraftApp {
         if close {
             self.ui_error = None;
         }
+    }
+}
+
+fn complete_relink(pending: &mut Vec<u64>, status: &mut String, outcome: filmcraft_engine::import_jobs::CommandOutcome) {
+    pending.retain(|job| *job != outcome.job);
+    *status = match outcome.result {
+        Ok(value) => tlf!("Linked {n} clip(s)", n = value["relinked"].as_array().map_or(0, Vec::len)),
+        Err(error) => error,
+    };
+}
+
+#[cfg(test)]
+mod relink_job_tests {
+    #[test]
+    fn completed_job_sets_status_and_removes_only_its_job() {
+        let mut pending = vec![7, 8];
+        let mut status = String::new();
+        super::complete_relink(&mut pending, &mut status, filmcraft_engine::import_jobs::CommandOutcome {
+            job: 7, command: "media.relink".into(), result: Ok(serde_json::json!({"relinked": [{"item": 1}]})),
+        });
+        assert_eq!(pending, vec![8]);
+        assert_eq!(status, tlf!("Linked {n} clip(s)", n = 1));
+        super::complete_relink(&mut pending, &mut status, filmcraft_engine::import_jobs::CommandOutcome {
+            job: 8, command: "media.relink".into(), result: Err("cancelled".into()),
+        });
+        assert!(pending.is_empty());
+        assert_eq!(status, "cancelled");
     }
 }

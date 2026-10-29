@@ -59,6 +59,7 @@ pub struct MediaPool {
     /// Media and proxy paths that came from a document, with that document's path (see
     /// [`Self::follow`]).
     stored: RwLock<HashMap<String, Option<PathBuf>>>,
+    stash: Mutex<HashMap<String, (web_time::Instant, SharedSource)>>,
 }
 
 impl Default for MediaPool {
@@ -72,9 +73,13 @@ impl Default for MediaPool {
             failures: Arc::default(),
             openers: RwLock::new(filmcraft_codecs::openers()),
             stored: RwLock::default(),
+            stash: Mutex::default(),
         }
     }
 }
+
+/// Maximum lifetime of a prefetched relink candidate.
+pub const STASH_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Largest file [`MediaPool::probe_file`] reads whole when no streaming reader takes it (WAV,
 /// MP3 and other byte-opened formats, or an unsupported container).
@@ -146,6 +151,40 @@ fn file_name(path: &str) -> String {
 }
 
 impl MediaPool {
+    /// Keep a recently opened candidate until the session commits its relink.
+    pub fn stash_source(&self, path: &str, source: SharedSource) {
+        self.stash_source_at(path, source, web_time::Instant::now());
+    }
+
+    fn stash_source_at(&self, path: &str, source: SharedSource, now: web_time::Instant) {
+        let mut stash = self.stash.lock().unwrap_or_else(PoisonError::into_inner);
+        stash.retain(|_, (time, _)| now.saturating_duration_since(*time) < STASH_TTL);
+        stash.insert(path.to_string(), (now, source));
+        if stash.len() > 256
+            && let Some(oldest) = stash.iter().min_by_key(|(_, (time, _))| *time).map(|(path, _)| path.clone())
+        {
+            stash.remove(&oldest);
+        }
+    }
+
+    #[cfg(any(test, not(target_arch = "wasm32")))]
+    pub(crate) fn is_stashed(&self, path: &str) -> bool {
+        let now = web_time::Instant::now();
+        let mut stash = self.stash.lock().unwrap_or_else(PoisonError::into_inner);
+        stash.retain(|_, (time, _)| now.saturating_duration_since(*time) < STASH_TTL);
+        stash.contains_key(path)
+    }
+
+    fn take_stashed(&self, path: &str) -> Option<SharedSource> {
+        self.take_stashed_at(path, web_time::Instant::now())
+    }
+
+    fn take_stashed_at(&self, path: &str, now: web_time::Instant) -> Option<SharedSource> {
+        let mut stash = self.stash.lock().unwrap_or_else(PoisonError::into_inner);
+        stash.retain(|_, (time, _)| now.saturating_duration_since(*time) < STASH_TTL);
+        stash.remove(path).map(|(_, source)| source)
+    }
+
     pub fn register_opener(&self, o: Opener) {
         self.openers.write().unwrap_or_else(PoisonError::into_inner).push(o);
     }
@@ -279,6 +318,9 @@ impl MediaPool {
     /// Read and open a file through `services` (through its random-access reader when the host
     /// has one: containers then read only their index now and samples on demand).
     pub fn open_file(&self, path: &str, services: &dyn Services) -> Result<SharedSource, MediaError> {
+        if let Some(source) = self.take_stashed(path) {
+            return Ok(source);
+        }
         let _scope = crate::watchdog::scope("media.open", path);
         let io = |e: std::io::Error| if e.kind() == std::io::ErrorKind::NotFound { MediaError::Offline(e.to_string()) } else { MediaError::Io(e.to_string()) };
         if let Some(r) = services.reader(path) {
@@ -302,23 +344,30 @@ impl MediaPool {
 
     /// Resolve (and cache) the source for a project item, using proxies when they are enabled.
     pub fn source_for(&self, p: &Project, item: ItemId, services: &dyn Services) -> Option<SharedSource> {
-        self.resolve(p, item, services, self.use_proxies())
+        self.resolve(p, item, Some(services), self.use_proxies())
     }
 
     /// Resolve the full-resolution source for an item (never a proxy).
     pub fn full_res_source(&self, p: &Project, item: ItemId, services: &dyn Services) -> Option<SharedSource> {
-        self.resolve(p, item, services, false)
+        self.resolve(p, item, Some(services), false)
     }
 
-    fn resolve(&self, p: &Project, item: ItemId, services: &dyn Services, proxies: bool) -> Option<SharedSource> {
+    /// Resolve only sources that need no file access, respecting proxy and reference keys.
+    pub fn cached_source(&self, p: &Project, item: ItemId) -> Option<SharedSource> {
+        self.resolve(p, item, None, self.use_proxies())
+    }
+
+    fn resolve(&self, p: &Project, item: ItemId, services: Option<&dyn Services>, proxies: bool) -> Option<SharedSource> {
         let (item, m, _) = p.resolve_media(item)?;
         let it = p.item(item)?;
         if proxies
             && !m.offline
             && let Some(MediaRef::File { path }) = &m.proxy
-            && let Some(s) = self.proxy_source(item, path, m, services)
         {
-            return Some(s);
+            if let Some(s) = self.proxy_source(item, path, m, services) {
+                return Some(s);
+            }
+            services?;
         }
         let key = media_key(m);
         if let Some((k, s)) = self.sources.read().unwrap_or_else(PoisonError::into_inner).get(&item)
@@ -336,29 +385,32 @@ impl MediaPool {
                 self.set_offline(item, OfflineReason::MadeOffline, path, "made offline");
                 Arc::new(SlateSource::new(m.info.clone(), &file_name(path), OfflineReason::MadeOffline))
             }
-            MediaRef::File { path } => match self.follow_media(path).and_then(|file| {
-                if m.info.kind == filmcraft_media::MediaKind::ImageSequence {
-                    let _scope = crate::watchdog::scope("media.open", path);
-                    open_image_sequence(&file, services, m.info.frame_rate(), &it.name)
-                } else {
-                    self.open_file(&file, services)
+            MediaRef::File { path } => {
+                let services = services?;
+                match self.follow_media(path).and_then(|file| {
+                    if m.info.kind == filmcraft_media::MediaKind::ImageSequence {
+                        let _scope = crate::watchdog::scope("media.open", path);
+                        open_image_sequence(&file, services, m.info.frame_rate(), &it.name)
+                    } else {
+                        self.open_file(&file, services)
+                    }
+                }) {
+                    Ok(s) => {
+                        self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
+                        self.unsupported_as_slate(item, path, s)
+                    }
+                    Err(_) if filmcraft_media::pending::is_set() => {
+                        // the host is still fetching the file's bytes: show the slate for now, retry later
+                        return Some(Arc::new(SlateSource::new(m.info.clone(), &file_name(path), OfflineReason::Missing)));
+                    }
+                    Err(e) => {
+                        log::warn!("media offline: {path}: {e}");
+                        let reason = if matches!(e, MediaError::Offline(_)) { OfflineReason::Missing } else { OfflineReason::Unreadable };
+                        self.set_offline(item, reason, path, &e.to_string());
+                        Arc::new(SlateSource::new(m.info.clone(), &file_name(path), reason))
+                    }
                 }
-            }) {
-                Ok(s) => {
-                    self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
-                    self.unsupported_as_slate(item, path, s)
-                }
-                Err(_) if filmcraft_media::pending::is_set() => {
-                    // the host is still fetching the file's bytes: show the slate for now, retry later
-                    return Some(Arc::new(SlateSource::new(m.info.clone(), &file_name(path), OfflineReason::Missing)));
-                }
-                Err(e) => {
-                    log::warn!("media offline: {path}: {e}");
-                    let reason = if matches!(e, MediaError::Offline(_)) { OfflineReason::Missing } else { OfflineReason::Unreadable };
-                    self.set_offline(item, reason, path, &e.to_string());
-                    Arc::new(SlateSource::new(m.info.clone(), &file_name(path), reason))
-                }
-            },
+            }
         };
         self.sources.write().unwrap_or_else(PoisonError::into_inner).insert(item, (key, src.clone()));
         Some(src)
@@ -368,13 +420,14 @@ impl MediaPool {
         self.offline.write().unwrap_or_else(PoisonError::into_inner).insert(item, OfflineStatus { reason, path: path.to_string(), error: error.to_string() });
     }
 
-    fn proxy_source(&self, item: ItemId, path: &str, m: &MediaClip, services: &dyn Services) -> Option<SharedSource> {
+    fn proxy_source(&self, item: ItemId, path: &str, m: &MediaClip, services: Option<&dyn Services>) -> Option<SharedSource> {
         let key = format!("proxy:{path}");
         if let Some((k, s)) = self.proxies.read().unwrap_or_else(PoisonError::into_inner).get(&item)
             && *k == key
         {
             return Some(s.clone());
         }
+        let services = services?;
         match self.follow_media(path).and_then(|file| self.open_file(&file, services)) {
             Ok(s) => {
                 // a proxy with fewer audio streams than the original (say one track of an OBS
@@ -636,6 +689,33 @@ impl MediaSource for ProxySource {
 mod tests {
     use super::*;
     use filmcraft_project::ItemKind;
+
+    #[test]
+    fn stash_is_single_use_expires_and_is_bounded() {
+        let pool = MediaPool::default();
+        let source: SharedSource = Arc::new(GeneratorSource::new(
+            filmcraft_media::Generator::ColorMatte { color: [0.0; 4] }, 16, 8, Default::default(), filmcraft_time::Tick(100),
+        ));
+        let fs = crate::media_browser_tests::FakeFs::default();
+        pool.stash_source("/candidate.wav", source.clone());
+        assert!(Arc::ptr_eq(&pool.open_file("/candidate.wav", &fs).unwrap(), &source));
+        assert!(pool.open_file("/candidate.wav", &fs).is_err());
+        let now = web_time::Instant::now();
+        pool.stash.lock().unwrap().insert("expired".into(), (now, source.clone()));
+        assert!(pool.take_stashed_at("expired", now + super::STASH_TTL).is_none());
+        assert!(pool.stash.lock().unwrap().is_empty());
+        for n in 0..256 {
+            pool.stash_source_at(&format!("candidate{n}"), source.clone(), now + std::time::Duration::from_millis(1));
+        }
+        assert_eq!(pool.stash.lock().unwrap().len(), 256);
+        assert!(pool.take_stashed("candidate0").is_some());
+        // Give one entry a strictly earlier insertion time without waiting for the clock.
+        pool.stash.lock().unwrap().insert("oldest".into(), (now, source.clone()));
+        pool.stash_source_at("newest", source, now + std::time::Duration::from_millis(2));
+        assert_eq!(pool.stash.lock().unwrap().len(), 256);
+        assert!(!pool.is_stashed("oldest"));
+        assert!(pool.is_stashed("newest"));
+    }
 
     /// A host whose whole-file read fails: opening must go through the reader.
     struct ReaderOnly(Arc<[u8]>);

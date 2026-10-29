@@ -178,7 +178,7 @@ pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId, stream: usize)
         return Some(p.clone());
     }
     // No source: try again on a later frame instead of leaving the item pending forever.
-    let src = app.session.source(item)?;
+    let src = app.session.source_if_open(item)?;
     {
         let mut pend = app.tl.peaks_pending.lock().unwrap_or_else(|e| e.into_inner());
         if pend.contains(&pkey) {
@@ -199,4 +199,25 @@ pub(crate) fn request_peaks(app: &mut FilmcraftApp, item: ItemId, stream: usize)
     #[cfg(target_arch = "wasm32")]
     run();
     None
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    #[test]
+    fn peak_requests_return_while_the_source_open_is_gated() {
+        let (session, item, gate) = crate::source_playback::tests::gated_session();
+        let mut app = crate::FilmcraftApp::new(session);
+        let began = std::time::Instant::now();
+        assert!(super::request_peaks(&mut app, item, 0).is_none());
+        assert!(began.elapsed() < std::time::Duration::from_secs(5));
+        gate.entered.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(super::request_peaks(&mut app, item, 0).is_none());
+        assert_eq!(app.session.jobs.len(), 1);
+        assert!(app.tl.peaks_pending.lock().unwrap().is_empty());
+        gate.release.send(()).unwrap();
+        let job = app.session.jobs[0].id;
+        let out = app.session.execute("file.importStatus", serde_json::json!({"job": job, "wait": true, "timeoutMs": 5000})).unwrap();
+        assert_eq!(out["pending"], 0);
+        assert!(app.session.source_if_open(item).is_some());
+    }
 }

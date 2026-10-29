@@ -312,6 +312,7 @@ pub struct FilmcraftApp {
     /// (in the coordinates of the viewport the files were dropped on).
     pending_timeline_drop: Option<(Vec<filmcraft_engine::project::ItemId>, egui::Pos2, egui::ViewportId)>,
     pending_import_drops: Vec<app::input::PendingImportDrop>,
+    pending_relinks: Vec<u64>,
     /// Files being dragged over a window from the OS (count, pointer, viewport): the Timeline previews where they would land.
     file_drag_hover: Option<(usize, egui::Pos2, egui::ViewportId)>,
     /// Files dragged over or dropped on dock panels in their own OS windows last frame; the

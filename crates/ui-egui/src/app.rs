@@ -101,6 +101,7 @@ impl FilmcraftApp {
             timeline_view_of: None,
             pending_timeline_drop: None,
             pending_import_drops: Vec::new(),
+            pending_relinks: Vec::new(),
             file_drag_hover: None,
             window_files: Vec::new(),
             timeline_view_last: None,

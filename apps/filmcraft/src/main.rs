@@ -244,7 +244,7 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
         session.voiceover.input = Some(Box::new(audio_in::CpalIn::new(&session.prefs.audio_hardware.device_class)));
         let (project, media) = args::project_and_media(&files);
         if let Some(p) = project {
-            if let Err(e) = session.execute("file.open", json!({"path": p})) {
+            if let Err(e) = session.execute("file.open", json!({"path": p, "warm": true})) {
                 log::error!("{e}");
             }
         } else if !startup_flag && session.prefs.general.at_startup == "openMostRecent" {
@@ -252,7 +252,7 @@ fn app_creator(launch: Launch, graphics: graphics::GraphicsStart, created: Arc<A
             let recent = session.prefs.general.recent_projects.iter().find(|p| std::path::Path::new(p).exists()).cloned();
             match recent {
                 Some(p) => {
-                    if let Err(e) = session.execute("file.open", json!({"path": p})) {
+                    if let Err(e) = session.execute("file.open", json!({"path": p, "warm": true})) {
                         log::error!("{e}");
                     }
                 }

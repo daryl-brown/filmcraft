@@ -27,7 +27,18 @@ pub(crate) fn feed_loudness(app: &mut FilmcraftApp) {
     if now <= next {
         return;
     }
-    let provider = app.session.media.provider(app.session.project.clone(), app.session.services.clone());
+    let (_, used) = filmcraft_engine::project_manager::used_ranges(&app.session.project, &app.session.state.open_sequences);
+    let media: Vec<_> = used.into_iter().filter(|item| app.session.project.resolve_media(*item).is_some()).collect();
+    let mut ready = true;
+    for item in media {
+        if app.session.source_if_open(item).is_none() {
+            ready = false;
+        }
+    }
+    if !ready {
+        return;
+    }
+    let provider = |item| app.session.media.cached_source(&app.session.project, item);
     let Some(seq_id) = app.session.state.active_sequence else { return };
     let buf = app.session.previews.mix(&app.session.project, seq_id, next, (now - next) as usize, &provider);
     if let Some((m, n)) = app.loudness.as_mut() {

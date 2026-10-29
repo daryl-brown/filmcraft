@@ -29,6 +29,7 @@ mod keyframe_move;
 mod marker_export;
 pub mod masks;
 pub mod media_browser;
+mod media_open;
 pub mod media_pool;
 pub mod media_watch;
 pub mod mixer;
@@ -483,7 +484,11 @@ pub struct Session {
     /// Scene Edit Detection jobs whose results are applied when they finish.
     pub scene_jobs: Vec<scene_detect::PendingScene>,
     pub import_jobs: Vec<import_jobs::PendingImport>,
+    pub(crate) opening_items: std::collections::HashSet<ItemId>,
+    pub(crate) open_workers: Vec<media_open::PendingOpen>,
+    pub(crate) opening_times: std::collections::HashMap<ItemId, web_time::Instant>,
     pub import_results: Vec<import_jobs::ImportOutcome>,
+    pub command_results: Vec<import_jobs::CommandOutcome>,
     /// Effect presets (built-in + the user's, persisted in the data directory).
     pub presets: presets::PresetLibrary,
     /// Export presets (built-in + the user's, persisted in the data directory) and favourites.
@@ -590,7 +595,11 @@ impl Session {
             mask_jobs: Vec::new(),
             scene_jobs: Vec::new(),
             import_jobs: Vec::new(),
+            opening_items: Default::default(),
+            open_workers: Default::default(),
+            opening_times: Default::default(),
             import_results: Vec::new(),
+            command_results: Vec::new(),
             presets: Default::default(),
             export_presets: Default::default(),
             export_queue: Default::default(),
@@ -685,6 +694,17 @@ impl Session {
         std::mem::take(&mut self.import_results)
     }
 
+    /// Drain deferred command outcomes once.
+    pub fn take_command_outcomes(&mut self) -> Vec<import_jobs::CommandOutcome> {
+        std::mem::take(&mut self.command_results)
+    }
+
+    /// Drain only the selected job, leaving other consumers' outcomes available.
+    pub fn take_command_outcome(&mut self, job: u64) -> Option<import_jobs::CommandOutcome> {
+        let index = self.command_results.iter().position(|outcome| outcome.job == job)?;
+        Some(self.command_results.remove(index))
+    }
+
     /// Apply worker notifications (call regularly, e.g. once per UI frame). Also applies the
     /// results of finished proxy / ingest jobs.
     pub fn poll_persistence(&mut self) {
@@ -692,6 +712,7 @@ impl Session {
         masks::poll(self);
         scene_detect::poll(self);
         import_jobs::poll(self);
+        media_open::poll(self);
         export_tools::pump_queue(self, false);
         panels::log_jobs(self);
         let Some(p) = self.persistence.as_mut() else { return };
@@ -1183,6 +1204,40 @@ impl Session {
     /// The media source for an item (creating it on first use).
     pub fn source(&self, item: ItemId) -> Option<filmcraft_media::SharedSource> {
         self.media.source_for(&self.project, item, &*self.services)
+    }
+
+    /// Look up a source without opening files on the calling thread.
+    pub fn source_if_open(&mut self, item: ItemId) -> Option<filmcraft_media::SharedSource> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.source(item)
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let source = self.media.cached_source(&self.project, item);
+            if source.is_none() {
+                self.request_open(item);
+            }
+            source
+        }
+    }
+
+    /// Queue one source once, with a cooldown after an unsuccessful request.
+    pub fn request_open(&mut self, item: ItemId) {
+        #[cfg(target_arch = "wasm32")]
+        let _ = item;
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::media_open::poll(self);
+            let Some((item, _, _)) = self.project.resolve_media(item) else { return };
+            if self.opening_items.contains(&item) || !crate::media_open::retry_ready(self.opening_times.get(&item), web_time::Instant::now()) {
+                return;
+            }
+            self.opening_times.insert(item, web_time::Instant::now());
+            if let Err(error) = self.execute("media.openInBackground", serde_json::json!({"items": [item.0]})) {
+                self.error_toast("media.openInBackground", error.to_string());
+            }
+        }
     }
 
     /// Render the active sequence at the playhead in its working colour space (HDR values kept;

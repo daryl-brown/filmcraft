@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 
 use filmcraft_engine::clip_ops::source_view;
 use filmcraft_project::ItemId;
-use filmcraft_render::SourceProvider;
 use filmcraft_time::Tick;
 use serde_json::json;
 
@@ -139,10 +138,10 @@ impl FilmcraftApp {
             self.source_playback.clock.audio_retry_at = 0.0;
             return;
         }
-        let project = self.session.project.clone();
-        let provider = self.session.media.provider(project, self.session.services.clone());
-        let Some(source) = provider.source(view.media) else {
-            self.ui.status = "Source audio is unavailable: check Link Media".into();
+        let clips = media.interpret.audio_channels.as_ref().map(|m| m.clips.clone()).unwrap_or_default();
+        let Some(source) = self.session.source_if_open(view.media) else {
+            self.ui.status = "Opening source audio".into();
+            self.source_playback.clock.audio_retry_at = now + AUDIO_RETRY_S;
             return;
         };
         let Some(audio) = self.audio.as_mut() else { return };
@@ -153,7 +152,6 @@ impl FilmcraftApp {
         }
         let map = [self.session.prefs.audio_hardware.map_left, self.session.prefs.audio_hardware.map_right];
         let mixdown = filmcraft_audio_dsp::channels::Mixdown::from_id(&self.session.prefs.audio.mixdown_type).unwrap_or_default();
-        let clips = media.interpret.audio_channels.as_ref().map(|m| m.clips.clone()).unwrap_or_default();
         // A seek gets its own failure slot: a late callback from the old stream cannot stop it.
         self.source_playback.failure = Arc::new(Mutex::new(None));
         let failure = self.source_playback.failure.clone();
@@ -353,7 +351,7 @@ impl FilmcraftApp {
 }
 
 #[cfg(test)]
-mod tests {
+mod preroll_tests {
     use super::FilmcraftApp;
     use filmcraft_engine::Session;
     use filmcraft_time::Tick;
@@ -468,5 +466,121 @@ mod tests {
         assert_eq!(app.source_playback.clock.anchor_tick, start);
         advance(&mut app, 1.5);
         assert!(app.session.state.source_playhead > start);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use filmcraft_engine::{Services, Session};
+    use filmcraft_project::{ItemId, ItemKind, Label, MediaClip, MediaRef};
+    use serde_json::json;
+
+    use crate::{AudioOut, FilmcraftApp};
+
+    struct GatedFs {
+        bytes: Vec<u8>,
+        entered: Sender<()>,
+        gate: Mutex<Option<Receiver<()>>>,
+    }
+
+    impl Services for GatedFs {
+        fn read_file(&self, _path: &str) -> std::io::Result<Vec<u8>> {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                self.entered.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(30)).unwrap();
+            }
+            Ok(self.bytes.clone())
+        }
+        fn write_file(&self, _path: &str, _bytes: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn file_size(&self, _path: &str) -> std::io::Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    pub(crate) struct Gate {
+        pub(crate) entered: Receiver<()>,
+        pub(crate) release: Sender<()>,
+    }
+
+    impl Drop for Gate {
+        fn drop(&mut self) {
+            let _ = self.release.send(());
+        }
+    }
+
+    pub(crate) fn gated_session() -> (Session, ItemId, Gate) {
+        let bytes = filmcraft_media::wav::write_wav16(&vec![0.0; 48_000 * 2 * 20], 2, 48_000);
+        let source = filmcraft_engine::MediaPool::default().open_bytes("test.wav", bytes.clone().into()).unwrap();
+        let (entered, ready) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let mut session = Session::new(Arc::new(GatedFs { bytes, entered, gate: Mutex::new(Some(gate)) }));
+        let info = source.info().clone();
+        let item = Arc::make_mut(&mut session.project).add_item("test", Label::Iris, ItemKind::Media(Box::new(MediaClip {
+            media: MediaRef::File { path: "/test.wav".into() }, info, interpret: Default::default(), mark_in: None, mark_out: None,
+            markers: Vec::new(), offline: false, proxy: None, identity: None,
+        })), None);
+        (session, item, Gate { entered: ready, release })
+    }
+
+    struct Output(Arc<AtomicUsize>);
+    impl AudioOut for Output {
+        fn start(&mut self, _fill: Box<dyn FnMut(&mut [f32], usize) + Send>) -> Result<u32, String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(48_000)
+        }
+        fn stop(&mut self) {}
+        fn sample_rate(&self) -> u32 {
+            48_000
+        }
+        fn channels(&self) -> usize {
+            2
+        }
+        fn played_frames(&self) -> Option<u64> {
+            Some(0)
+        }
+    }
+
+    #[test]
+    fn source_audio_returns_while_opening_and_retries_on_the_wall_clock() {
+        let (mut session, item, gate) = gated_session();
+        session.execute("source.open", json!({"item": item.0})).unwrap();
+        let mut app = FilmcraftApp::new(session);
+        let starts = Arc::new(AtomicUsize::new(0));
+        app.audio = Some(Box::new(Output(starts.clone())));
+        let began = Instant::now();
+        app.play_source().unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        // The clock waits for its preroll; the audio start (and so the source open) follows it.
+        assert!(app.source_playback.clock.preroll.is_some());
+        let ctx = egui::Context::default();
+        app.source_playback.clock.preroll_ready = true;
+        app.set_now_for_test(0.0);
+        app.advance_source_playback(&ctx);
+        gate.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(app.source_playback.clock.playing);
+        assert!(!app.source_playback.clock.audio_clock);
+        assert!(app.source_playback.clock.audio_retry_at > 0.0);
+        assert_eq!(starts.load(Ordering::Relaxed), 0);
+        assert_eq!(app.ui.status, "Opening source audio");
+        app.set_now_for_test(1.0);
+        app.advance_source_playback(&ctx);
+        assert!(app.session.state.source_playhead > filmcraft_time::Tick::ZERO);
+        gate.release.send(()).unwrap();
+        let job = app.session.jobs[0].id;
+        app.session.execute("file.importStatus", json!({"job": job, "wait": true, "timeoutMs": 5000})).unwrap();
+        app.set_now_for_test(3.0);
+        app.advance_source_playback(&ctx);
+        assert_eq!(starts.load(Ordering::Relaxed), 1);
+        assert!(app.source_playback.clock.audio_clock);
+        assert_eq!(app.source_playback.clock.audio_retry_at, 0.0);
+        app.stop_source();
     }
 }
