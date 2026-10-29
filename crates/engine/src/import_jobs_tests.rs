@@ -383,7 +383,8 @@ mod native {
         assert_eq!(completed["outcomes"][0]["items"].as_array().unwrap().len(), 2);
         assert_eq!(completed["outcomes"][0]["errors"], json!([]));
         assert_eq!(completed["jobs"][0]["done"], 2);
-        assert_eq!(fs.state.lock().unwrap().entered, 2);
+        // Only the two files that were being opened were opened (the commit may read them again).
+        assert_eq!(fs.state.lock().unwrap().opens.len(), 2);
     }
 
     fn ordered_items(s: &Session, outcome: &Value) -> Vec<Value> {
