@@ -56,6 +56,7 @@ pub mod sync;
 pub mod transcript;
 pub mod trim;
 pub mod voiceover;
+pub mod watchdog;
 
 use std::sync::Arc;
 
@@ -746,6 +747,9 @@ impl Session {
 
     /// Run a command by id.
     pub fn execute(&mut self, id: &str, params: Value) -> Result<Value> {
+        let detail = params.get("paths").and_then(|paths| paths.get(0)).and_then(Value::as_str)
+            .or_else(|| params.get("path").and_then(Value::as_str)).unwrap_or_default();
+        let _scope = watchdog::scope(id, detail);
         let spec = commands::find(id).ok_or_else(|| EngineError::UnknownCommand(id.to_string()))?;
         if self.exec_depth == 0 && spec.journal && self.trim_play.active() {
             self.settle_trim_playback(id);
