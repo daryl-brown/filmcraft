@@ -99,6 +99,21 @@ jobs:
           Invoke-Logged -Title 'cargo test codecs h264_intra' -Command { cargo test --locked -p filmcraft-codecs --test h264_intra --target $env:TARGET --message-format short }
           Invoke-Logged -Title 'cargo test codecs gop' -Command { cargo test --locked -p filmcraft-codecs --lib gop:: --target $env:TARGET --message-format short }
 
+      - name: Test audio breakout, stall watchdog, folder import and background import (debug, locked)
+        shell: pwsh
+        run: |
+          . ./.github/scripts/ci-logged.ps1
+          Invoke-Logged -Title 'cargo test engine package' -Command { cargo test --locked -p filmcraft-engine --lib --target $env:TARGET --message-format short -- audio_placement_tests settings_tests media_browser import_jobs_tests watchdog project_tools }
+          Invoke-Logged -Title 'cargo test render mixer' -Command { cargo test --locked -p filmcraft-render --lib --target $env:TARGET --message-format short -- mixer_tests }
+          Invoke-Logged -Title 'cargo test ui drop' -Command { cargo test --locked -p filmcraft-ui-egui --lib --target $env:TARGET --message-format short -- import_drop_tests }
+
+      - name: Test whole engine library (debug, locked; regression information only)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          . ./.github/scripts/ci-logged.ps1
+          Invoke-Logged -Title 'cargo test engine all' -Command { cargo test --locked -p filmcraft-engine --lib --target $env:TARGET --message-format short }
+
       - name: Build (release, locked, whisper enabled)
         shell: pwsh
         env:
