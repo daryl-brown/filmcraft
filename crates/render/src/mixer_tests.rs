@@ -749,3 +749,64 @@ fn a_nest_trimmed_in_starts_later_in_its_sequence() {
     let mix = mix_graph(&p, p.sequence(outer).unwrap(), start, 4800, &map, None);
     assert!(worst(&mix, start, 8, |t| tone.at(t + 3.0)) < 0.01);
 }
+
+#[test]
+fn source_clip_mix_keeps_unmapped_and_single_clip_audio_identical() {
+    use filmcraft_audio_dsp::channels::{Layout, Mixdown};
+
+    use crate::audio::{mix_source_clips, to_layout};
+    let sound = AudioBuffer { sample_rate: SR, channels: vec![vec![0.25, -0.5], vec![0.5, -0.25], vec![0.125, 0.75]] };
+    assert_eq!(mix_source_clips(sound.clone(), &[], Mixdown::FrontRear), to_layout(sound.clone(), Layout::Stereo, Mixdown::FrontRear));
+    for channels in [vec![], vec![2], vec![1, 0], vec![99], vec![99, 1]] {
+        let mut old = sound.clone();
+        if !channels.is_empty() {
+            old.channels = channels.iter().filter_map(|c| old.channels.get(usize::from(*c)).cloned()).collect();
+        }
+        assert_eq!(mix_source_clips(sound.clone(), &[channels], Mixdown::FrontRear), to_layout(old, Layout::Stereo, Mixdown::FrontRear));
+    }
+}
+
+#[test]
+fn source_clip_mix_sums_stereo_pairs_with_equal_power_gain() {
+    use filmcraft_audio_dsp::channels::Mixdown;
+    let sound = AudioBuffer { sample_rate: SR, channels: vec![vec![0.1, 0.2], vec![0.3, 0.4], vec![0.5, 0.6], vec![0.7, 0.8]] };
+    let mixed = crate::audio::mix_source_clips(sound, &[vec![0, 1], vec![2, 3]], Mixdown::FrontRear);
+    assert_eq!(mixed.sample_rate, SR);
+    assert_eq!(mixed.channels.len(), 2);
+    let gain = 1.0 / 2.0f32.sqrt();
+    for (got, want) in mixed.channels.iter().zip([[0.6, 0.8], [1.0, 1.2]]) {
+        assert_eq!(got.len(), 2);
+        for (g, w) in got.iter().zip(want) {
+            assert!(close(*g, w * gain, 1e-6));
+        }
+    }
+}
+
+#[test]
+fn source_clip_mix_pads_shorter_clips_with_zeros() {
+    use filmcraft_audio_dsp::channels::Mixdown;
+    let sound = AudioBuffer { sample_rate: SR, channels: vec![vec![0.25], vec![0.5, 0.75, 1.0]] };
+    let mixed = crate::audio::mix_source_clips(sound, &[vec![0], vec![1]], Mixdown::FrontRear);
+    let gain = 1.0 / 2.0f32.sqrt();
+    assert_eq!(mixed.channels.len(), 2);
+    for channel in mixed.channels {
+        assert_eq!(channel.len(), 3);
+        for (got, want) in channel.iter().zip([0.75, 0.75, 1.0]) {
+            assert!(close(*got, want * gain, 1e-6));
+        }
+    }
+}
+
+#[test]
+fn source_clip_mix_ignores_missing_channel_indices() {
+    use filmcraft_audio_dsp::channels::Mixdown;
+    let sound = AudioBuffer { sample_rate: SR, channels: vec![vec![0.25, 0.5]] };
+    let mixed = crate::audio::mix_source_clips(sound, &[vec![99, 0], vec![u16::MAX]], Mixdown::FrontRear);
+    assert_eq!(mixed.channels.len(), 2);
+    for channel in mixed.channels {
+        assert_eq!(channel.len(), 2);
+        for (got, want) in channel.iter().zip([0.25, 0.5]) {
+            assert!(close(*got, want / 2.0f32.sqrt(), 1e-6));
+        }
+    }
+}

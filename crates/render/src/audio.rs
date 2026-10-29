@@ -57,6 +57,35 @@ pub fn to_layout(b: AudioBuffer, layout: Layout, mixdown: Mixdown) -> AudioBuffe
     AudioBuffer { sample_rate: b.sample_rate, channels: chans::convert_owned(b.channels, layout, mixdown) }
 }
 
+/// Audition every mapped source clip in stereo, with equal-power gain across clips.
+/// No map or a single clip keeps the existing conversion and gain.
+pub fn mix_source_clips(mut sound: AudioBuffer, clips: &[Vec<u16>], mixdown: Mixdown) -> AudioBuffer {
+    if clips.len() <= 1 {
+        if let Some(channels) = clips.first().filter(|c| !c.is_empty()) {
+            sound.channels = channels.iter().filter_map(|c| sound.channels.get(usize::from(*c)).cloned()).collect();
+        }
+        return to_layout(sound, Layout::Stereo, mixdown);
+    }
+    let mut out = AudioBuffer::silence(sound.sample_rate, 2, 0);
+    let gain = 1.0 / (clips.len() as f32).sqrt();
+    for channels in clips {
+        let selected = if channels.is_empty() {
+            sound.channels.clone()
+        } else {
+            channels.iter().filter_map(|c| sound.channels.get(usize::from(*c)).cloned()).collect()
+        };
+        let clip = to_layout(AudioBuffer { sample_rate: sound.sample_rate, channels: selected }, Layout::Stereo, mixdown);
+        let frames = clip.channels.iter().map(Vec::len).max().unwrap_or(0);
+        for (dst, src) in out.channels.iter_mut().zip(&clip.channels) {
+            dst.resize(dst.len().max(frames), 0.0);
+            for (d, s) in dst.iter_mut().zip(src) {
+                *d += s * gain;
+            }
+        }
+    }
+    out
+}
+
 /// The layout of a sequence's Mix (`SequenceSettings::audio_master`; mono and adaptive Mixes play
 /// as stereo).
 pub fn master_layout(seq: &Sequence) -> Layout {

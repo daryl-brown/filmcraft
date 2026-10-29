@@ -190,6 +190,7 @@ fn v1_preferences_migrate_and_bad_values_are_repaired() {
     assert_eq!((p.trim.large_trim_offset, p.trim.playhead_determines_loop), (12, true));
     assert!(p.media.enable_proxies);
     assert_eq!(p.media.default_media_scaling, "none");
+    assert_eq!(p.media.default_audio_channels, "mono");
     assert_eq!(p.guides.templates[0].name, "T");
     assert_eq!(p.timeline, settings::TimelinePrefs::default());
     assert_eq!(p.labels.colors.len(), 16);
@@ -850,4 +851,24 @@ fn builtin_label_presets_are_complete_and_distinct() {
         assert_eq!(labels.name(label), role);
     }
     assert!(!settings::is_builtin_label_preset("Team"));
+}
+
+#[test]
+fn default_audio_channel_format_is_validated_persisted_and_reset() {
+    let dir = tmp_dir("audio-channel-prefs");
+    let path = dir.join("preferences.json");
+    let mut s = Session { prefs_path: Some(path.clone()), ..Session::default() };
+    assert_eq!(s.prefs.get("media.defaultAudioChannels"), Some(json!("mono")));
+    for value in ["stereo", "asIs", "mono"] {
+        set(&mut s, "media.defaultAudioChannels", json!(value));
+        assert_eq!(s.prefs.get("media.defaultAudioChannels"), Some(json!(value)));
+        assert_eq!(Preferences::load(&path).media.default_audio_channels, value);
+    }
+    assert!(s.execute("prefs.set", json!({"key": "media.defaultAudioChannels", "value": "invalid"})).is_err());
+    set(&mut s, "media.defaultAudioChannels", json!("stereo"));
+    s.execute("prefs.reset", json!({"category": "media"})).unwrap();
+    assert_eq!(s.prefs.media.default_audio_channels, "mono");
+    std::fs::write(&path, br#"{"media":{"defaultAudioChannels":"invalid"}}"#).unwrap();
+    assert_eq!(Preferences::load(&path).media.default_audio_channels, "mono");
+    std::fs::remove_dir_all(dir).unwrap();
 }

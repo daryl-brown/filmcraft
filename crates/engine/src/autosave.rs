@@ -247,6 +247,8 @@ pub struct MediaPrefs {
     pub frame_count: String,
     /// "Default Media Scaling": `none` | `scaleToFrameSize` | `setToFrameSize`.
     pub default_media_scaling: String,
+    /// Multichannel import layout: `mono` | `stereo` | `asIs`.
+    pub default_audio_channels: String,
     pub write_xmp_id: bool,
     pub validate_content_credentials: bool,
     pub write_clip_markers_to_xmp: bool,
@@ -273,6 +275,7 @@ impl Default for MediaPrefs {
             timecode: "useMediaSource".into(),
             frame_count: "startAt0".into(),
             default_media_scaling: "none".into(),
+            default_audio_channels: "mono".into(),
             write_xmp_id: false,
             validate_content_credentials: true,
             write_clip_markers_to_xmp: false,

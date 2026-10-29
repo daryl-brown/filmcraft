@@ -172,6 +172,11 @@ const TIMECODE: &[(&str, &str)] = &[("useMediaSource", "Use Media Source"), ("ge
 
 const FRAME_COUNT: &[(&str, &str)] = &[("startAt0", "Start at 0"), ("startAt1", "Start at 1"), ("timecodeConversion", "Timecode Conversion")];
 
+const AUDIO_CHANNEL_FORMATS: &[(&str, &str)] = &[
+    ("mono", "Mono breakout (one clip per channel)"),
+    ("stereo", "Stereo pairs"),
+    ("asIs", "As is (first two channels)"),
+];
 const SCALING: &[(&str, &str)] = &[("none", "None"), ("scaleToFrameSize", "Scale to frame size"), ("setToFrameSize", "Set to frame size")];
 
 const ANALYSIS_CACHE: &[(&str, &str)] = &[("mediaCache", "In the Media Cache"), ("project", "In the project")];
@@ -426,6 +431,7 @@ pub(super) static CATEGORIES: &[Category] = &[
             f("media.timecode", "Timecode", Kind::Choice(TIMECODE), false),
             f("media.frameCount", "Frame Count", Kind::Choice(FRAME_COUNT), false),
             f("media.defaultMediaScaling", "Default Media Scaling", Kind::Choice(SCALING), true),
+            f("media.defaultAudioChannels", "Default Audio Channel Format for Multichannel Media", Kind::Choice(AUDIO_CHANNEL_FORMATS), true),
             b("media.writeXmpId", "Write XMP ID to files on import", false),
             b("media.validateContentCredentials", "Validate Content Credentials on import", false),
             b("media.writeClipMarkersToXmp", "Write clip markers to XMP", false),

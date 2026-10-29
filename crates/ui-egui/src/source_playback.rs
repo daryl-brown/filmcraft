@@ -143,7 +143,7 @@ impl FilmcraftApp {
         }
         let map = [self.session.prefs.audio_hardware.map_left, self.session.prefs.audio_hardware.map_right];
         let mixdown = filmcraft_audio_dsp::channels::Mixdown::from_id(&self.session.prefs.audio.mixdown_type).unwrap_or_default();
-        let channels = media.interpret.audio_channels.as_ref().and_then(|m| m.clips.first()).cloned().unwrap_or_default();
+        let clips = media.interpret.audio_channels.as_ref().map(|m| m.clips.clone()).unwrap_or_default();
         // A seek gets its own failure slot: a late callback from the old stream cannot stop it.
         self.source_playback.failure = Arc::new(Mutex::new(None));
         let failure = self.source_playback.failure.clone();
@@ -160,11 +160,8 @@ impl FilmcraftApp {
             }
             let frames = (buf.len() / ch).min(usize::try_from(end.saturating_sub(cursor)).unwrap_or(0));
             match source.audio(cursor, frames, sr) {
-                Ok(mut sound) => {
-                    if !channels.is_empty() {
-                        sound.channels = channels.iter().filter_map(|c| sound.channels.get(usize::from(*c)).cloned()).collect();
-                    }
-                    let sound = filmcraft_render::audio::to_layout(sound, filmcraft_audio_dsp::channels::Layout::Stereo, mixdown);
+                Ok(sound) => {
+                    let sound = filmcraft_render::audio::mix_source_clips(sound, &clips, mixdown);
                     let Some(left) = sound.channels.first() else { return };
                     let right = sound.channels.get(1).unwrap_or(left);
                     filmcraft_engine::settings::map_output(left, right, buf, ch, map);
