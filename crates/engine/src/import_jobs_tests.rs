@@ -2,7 +2,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::time::{Duration, Instant};
 
@@ -80,6 +80,244 @@ mod native {
         assert_eq!(value["pending"], 0, "{value}");
         assert_eq!(value["jobs"][0]["finished"], true);
         value
+    }
+
+    #[derive(Default)]
+    struct OpenState {
+        active: usize,
+        maximum: usize,
+        entered: usize,
+        released: bool,
+    }
+
+    struct PoolFs {
+        fs: FakeFs,
+        state: Mutex<OpenState>,
+        changed: Condvar,
+        threshold: usize,
+    }
+
+    impl PoolFs {
+        fn release(&self) {
+            self.state.lock().unwrap().released = true;
+            self.changed.notify_all();
+        }
+
+        fn wait_for(&self, count: usize) {
+            let state = self.state.lock().unwrap();
+            let (_state, timeout) = self.changed.wait_timeout_while(state, Duration::from_secs(30), |s| s.entered < count).unwrap();
+            assert!(!timeout.timed_out(), "opens did not reach the gate");
+        }
+    }
+
+    impl Services for PoolFs {
+        fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            let mut state = self.state.lock().unwrap();
+            state.active += 1;
+            state.entered += 1;
+            state.maximum = state.maximum.max(state.active);
+            if self.threshold > 0 && state.active >= self.threshold {
+                state.released = true;
+            }
+            self.changed.notify_all();
+            let (mut state, timeout) = self.changed.wait_timeout_while(state, Duration::from_secs(30), |s| !s.released).unwrap();
+            state.active -= 1;
+            drop(state);
+            assert!(!timeout.timed_out(), "concurrent opens did not reach the gate");
+            assert!(!path.ends_with("panic.wav"), "synthetic open panic");
+            self.fs.read_file(path)
+        }
+
+        fn write_file(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.fs.write_file(path, bytes)
+        }
+
+        fn list_entries(&self, path: &str) -> Option<std::io::Result<Vec<crate::media_browser::DirEntry>>> {
+            self.fs.list_entries(path)
+        }
+    }
+
+    fn pool_fixture(count: usize, threshold: usize) -> (Session, Arc<PoolFs>, Vec<String>) {
+        let fs = folder_fixture();
+        let paths: Vec<String> = (0..count).map(|n| format!("/file{n}.wav")).collect();
+        {
+            let mut files = fs.files.lock().unwrap();
+            let wav = files.get("/outside.wav").unwrap().clone();
+            for path in &paths {
+                files.insert(path.clone(), wav.clone());
+            }
+        }
+        let fs = Arc::new(PoolFs { fs, state: Mutex::new(OpenState::default()), changed: Condvar::new(), threshold });
+        (Session::new(fs.clone()), fs, paths)
+    }
+
+    #[test]
+    fn background_opens_are_concurrent_and_bounded() {
+        for (count, threads, threshold) in [(4, 4, 2), (4, 1, 1), (8, 3, 3)] {
+            let (mut s, fs, paths) = pool_fixture(count, threshold);
+            let out = s.execute("file.import", json!({"paths": paths, "background": true, "openThreads": threads})).unwrap();
+            let completed = wait(&mut s, out["job"].as_u64().unwrap());
+            assert_eq!(completed["outcomes"][0]["items"].as_array().unwrap().len(), count);
+            assert_eq!(completed["outcomes"][0]["errors"], json!([]));
+            let maximum = fs.state.lock().unwrap().maximum;
+            assert!(maximum >= threshold && maximum <= threads);
+            if threads == 1 {
+                assert_eq!(maximum, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_cancel_keeps_only_active_files_and_reports_status() {
+        let (mut s, fs, paths) = pool_fixture(8, 0);
+        let out = s.execute("file.import", json!({"paths": paths, "background": true, "openThreads": 2})).unwrap();
+        let job = out["job"].as_u64().unwrap();
+        fs.wait_for(2);
+        let pending = s.execute("file.importStatus", json!({"job": job, "cancel": true})).unwrap();
+        assert!(pending["jobs"][0]["status"].as_str().unwrap().contains("2 files in progress"));
+        fs.release();
+        let completed = wait(&mut s, job);
+        assert_eq!(completed["outcomes"][0]["items"].as_array().unwrap().len(), 2);
+        assert_eq!(completed["outcomes"][0]["errors"], json!([]));
+        assert_eq!(completed["jobs"][0]["done"], 2);
+        assert_eq!(fs.state.lock().unwrap().entered, 2);
+    }
+
+    fn ordered_items(s: &Session, outcome: &Value) -> Vec<Value> {
+        outcome["items"].as_array().unwrap().iter().map(|id| {
+            let id = ItemId(id.as_u64().unwrap());
+            let item = s.project.item(id).unwrap();
+            let bin = s.project.root.parent_of(id).and_then(|bin| s.project.root.find_bin(bin)).map(|bin| &bin.name);
+            json!({"name": item.name, "media": item.as_media().unwrap().media, "bin": bin})
+        }).collect()
+    }
+
+    struct OrderedFs {
+        fs: FakeFs,
+        gates: Mutex<std::collections::BTreeMap<String, Receiver<()>>>,
+        entered: Sender<String>,
+    }
+
+    impl Services for OrderedFs {
+        fn read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+            let gate = self.gates.lock().unwrap().remove(path);
+            if let Some(gate) = gate {
+                self.entered.send(path.to_string()).unwrap();
+                gate.recv_timeout(Duration::from_secs(30)).unwrap();
+            }
+            self.fs.read_file(path)
+        }
+
+        fn write_file(&self, path: &str, bytes: &[u8]) -> std::io::Result<()> {
+            self.fs.write_file(path, bytes)
+        }
+
+        fn list_entries(&self, path: &str) -> Option<std::io::Result<Vec<crate::media_browser::DirEntry>>> {
+            self.fs.list_entries(path)
+        }
+    }
+
+    fn six_files() -> (FakeFs, Vec<String>) {
+        let mut fs = FakeFs::default();
+        fs.dirs = ["/six", "/six/A", "/six/B", "/empty"].map(String::from).to_vec();
+        let paths: Vec<String> = ["/six/0.wav", "/six/1.wav", "/six/A/2.wav", "/six/A/3.wav", "/six/B/4.wav", "/six/B/5.wav"]
+            .map(String::from).to_vec();
+        let wav = filmcraft_media::wav::write_wav16(&[0.0; 4800], 2, 48_000);
+        for path in &paths {
+            fs.files.get_mut().unwrap().insert(path.clone(), wav.clone());
+        }
+        (fs, paths)
+    }
+
+    fn wait_done(s: &Session, done: u64) {
+        let began = Instant::now();
+        while s.jobs[0].progress.done.load(std::sync::atomic::Ordering::Relaxed) < done {
+            assert!(began.elapsed() < Duration::from_secs(30));
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn concurrent_reversed_opens_keep_sequential_items_bins_and_errors() {
+        let (fs, paths) = six_files();
+        let mut gates = std::collections::BTreeMap::new();
+        let mut release = std::collections::BTreeMap::new();
+        for path in &paths {
+            let (send, receive) = mpsc::channel();
+            gates.insert(path.clone(), receive);
+            release.insert(path.clone(), send);
+        }
+        let (entered, ready) = mpsc::channel();
+        let fs = OrderedFs { fs, gates: Mutex::new(gates), entered };
+        let mut background = Session::new(Arc::new(fs));
+        let out = background.execute("file.import", json!({"paths": ["/six", "/empty"], "background": true, "openThreads": 4})).unwrap();
+        let mut first = Vec::new();
+        for _ in 0..4 {
+            first.push(ready.recv_timeout(Duration::from_secs(30)).unwrap());
+        }
+        first.sort();
+        assert_eq!(first, paths[..4]);
+        // Keep the earliest three files blocked while later files finish first.
+        for (done, index) in [3, 4, 5, 2, 1, 0].into_iter().enumerate() {
+            release.get(&paths[index]).unwrap().send(()).unwrap();
+            wait_done(&background, done as u64 + 1);
+            if done < 2 {
+                assert_eq!(ready.recv_timeout(Duration::from_secs(30)).unwrap(), paths[done + 4]);
+            }
+        }
+        let completed = wait(&mut background, out["job"].as_u64().unwrap());
+        let (fs, _) = six_files();
+        let mut sync = Session::new(Arc::new(fs));
+        let a = sync.execute("file.import", json!({"paths": ["/six", "/empty"]})).unwrap();
+        let b = &completed["outcomes"][0];
+        assert_eq!(ordered_items(&sync, &a), ordered_items(&background, b));
+        assert_eq!(tree(&sync, &sync.project.root), tree(&background, &background.project.root));
+        assert_eq!(a["errors"], b["errors"]);
+        assert_eq!(a["skipped"], b["skipped"]);
+        assert_eq!(a["bins"].as_array().unwrap().len(), b["bins"].as_array().unwrap().len());
+    }
+
+    #[test]
+    fn concurrent_errors_and_panics_do_not_lose_good_files() {
+        let (mut s, fs, paths) = pool_fixture(4, 1);
+        let out = s.execute("file.import", json!({
+            "paths": [paths[0], "/missing.wav", paths[1], "/panic.wav", paths[2], paths[3]],
+            "background": true, "openThreads": 4,
+        })).unwrap();
+        let completed = wait(&mut s, out["job"].as_u64().unwrap());
+        let outcome = &completed["outcomes"][0];
+        assert_eq!(outcome["items"].as_array().unwrap().len(), 4);
+        let names: Vec<Value> = ordered_items(&s, outcome).iter().map(|item| item["name"].clone()).collect();
+        assert_eq!(names, [json!("file0.wav"), json!("file1.wav"), json!("file2.wav"), json!("file3.wav")]);
+        assert_eq!(outcome["errors"].as_array().unwrap().len(), 2);
+        assert!(outcome["errors"][0].as_str().unwrap().starts_with("/missing.wav:"));
+        assert_eq!(outcome["errors"][1], "/panic.wav: the file could not be opened (internal error)");
+        assert_eq!(completed["jobs"][0]["done"], 6);
+        assert!(fs.state.lock().unwrap().maximum <= 4);
+    }
+
+    #[test]
+    fn browser_background_folder_returns_before_walk_and_matches_sync() {
+        let (mut background, gate) = gated_path("/root");
+        let began = Instant::now();
+        let out = background.execute("mediaBrowser.import", json!({"paths": ["/root"], "background": true, "openThreads": 2})).unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert_eq!(out["pending"], true);
+        assert_eq!(out["items"], json!([]));
+        assert_eq!(out["errors"], json!([]));
+        gate.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(background.project.root.children.is_empty());
+        gate.release.send(()).unwrap();
+        let completed = wait(&mut background, out["job"].as_u64().unwrap());
+        let b = &completed["outcomes"][0];
+        let mut sync = Session::new(Arc::new(folder_fixture()));
+        let a = sync.execute("mediaBrowser.import", json!({"paths": ["/root"]})).unwrap();
+        assert!(a.get("job").is_none());
+        assert_eq!(ordered_items(&sync, &a), ordered_items(&background, b));
+        assert_eq!(tree(&sync, &sync.project.root), tree(&background, &background.project.root));
+        assert_eq!(a["bins"].as_array().unwrap().len(), b["bins"].as_array().unwrap().len());
+        assert_eq!(a["skipped"], b["skipped"]);
+        assert_eq!(a["errors"], b["errors"]);
     }
 
     #[test]
@@ -228,7 +466,9 @@ mod native {
     #[test]
     fn cancel_during_open_commits_only_the_opened_file() {
         let (mut s, gate) = gated();
-        let out = s.execute("file.import", json!({"paths": ["/outside.wav", "/root/A/a1.wav", "/root/A/sub/s1.wav"], "background": true})).unwrap();
+        let out = s.execute("file.import", json!({
+            "paths": ["/outside.wav", "/root/A/a1.wav", "/root/A/sub/s1.wav"], "background": true, "openThreads": 1,
+        })).unwrap();
         let job = out["job"].as_u64().unwrap();
         gate.entered.recv_timeout(Duration::from_secs(5)).unwrap();
         s.execute("file.importStatus", json!({"job": job, "cancel": true})).unwrap();

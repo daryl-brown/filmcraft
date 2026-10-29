@@ -1,6 +1,8 @@
 //! Media opening jobs. Workers own handles and plain data; only polling edits the session.
 //!
 //! `file.import {background: true}` opens media and walks folders off the calling thread.
+//! `openThreads` sets the number of concurrent opens (clamped to 1 to 16), otherwise
+//! `FILMCRAFT_OPEN_THREADS` supplies it, with a default of four.
 //! Documents and image sequences remain immediate. Without `background`, and on wasm32,
 //! imports retain the synchronous command behaviour. `file.importStatus` polls, cancels or
 //! waits for import jobs (a 600000 ms default timeout, clamped to 1 to 3600000 ms).
@@ -36,8 +38,6 @@ struct Opened {
     identity: MediaIdentity,
     source: filmcraft_media::SharedSource,
     bin: Option<usize>,
-    #[cfg(not(target_arch = "wasm32"))]
-    seconds: f64,
 }
 
 struct Bin {
@@ -57,11 +57,31 @@ pub struct PendingImport {
     pub job: u64,
     parent: Option<BinId>,
     results: Arc<Mutex<Results>>,
-    current: Arc<Mutex<Option<(String, web_time::Instant)>>>,
+    current: Arc<Mutex<Vec<(usize, String, web_time::Instant)>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Default number of files opened concurrently by a background import.
+pub const OPEN_CONCURRENCY: usize = 4;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn open_limit(p: &Value, environment: Option<&str>) -> usize {
+    let integer = |v: &Value| v.as_i64().map(|n| n.clamp(1, 16) as usize).or_else(|| v.as_u64().map(|n| n.clamp(1, 16) as usize));
+    p.get("openThreads").and_then(integer)
+        .or_else(|| environment.and_then(|v| v.parse::<i64>().ok()).map(|n| n.clamp(1, 16) as usize))
+        .unwrap_or(OPEN_CONCURRENCY)
+}
+
+fn current_status(current: &[(usize, String, web_time::Instant)]) -> Option<String> {
+    let (_, name, began) = current.iter().min_by_key(|(_, _, began)| *began)?;
+    let mut status = format!("{name} ({} s)", began.elapsed().as_secs());
+    if current.len() > 1 {
+        status.push_str(&format!(", {} files in progress", current.len()));
+    }
+    Some(status)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -99,9 +119,10 @@ pub(crate) fn start(s: &mut Session, p: &Value, paths: Vec<String>, parent: Opti
     let job = crate::Job { id, label, progress: Default::default(), result: Default::default() };
     job.progress.total.store(work.len() as u64, Ordering::Relaxed);
     let results = Arc::new(Mutex::new(Results::default()));
-    let current = Arc::new(Mutex::new(None));
+    let current = Arc::new(Mutex::new(Vec::new()));
     let worker = Worker {
         media: s.media.clone(), services: s.services.clone(), progress: job.progress.clone(), results: results.clone(), current: current.clone(),
+        limit: open_limit(p, std::env::var("FILMCRAFT_OPEN_THREADS").ok().as_deref()),
     };
     let result = job.result.clone();
     let run = move || {
@@ -148,12 +169,16 @@ fn merge_waited(out: &mut Value, waited: &Value) {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+type IndexedOpens = Mutex<Vec<(usize, std::result::Result<Opened, String>)>>;
+
+#[cfg(not(target_arch = "wasm32"))]
 struct Worker {
     media: Arc<crate::media_pool::MediaPool>,
     services: Arc<dyn crate::Services>,
     progress: Arc<filmcraft_export::Progress>,
     results: Arc<Mutex<Results>>,
-    current: Arc<Mutex<Option<(String, web_time::Instant)>>>,
+    current: Arc<Mutex<Vec<(usize, String, web_time::Instant)>>>,
+    limit: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -164,20 +189,36 @@ impl Worker {
 
     fn run(&self, paths: Vec<String>) {
         let mut budget = crate::media_browser::FOLDER_IMPORT_MAX_FOLDERS;
+        let mut files = Vec::new();
         for path in paths {
             if self.cancelled() {
                 break;
             }
-            let files = self.files(path, &mut budget);
-            let total = self.progress.total.load(Ordering::Relaxed).saturating_sub(1).saturating_add(files.len() as u64);
-            self.progress.total.store(total, Ordering::Relaxed);
-            for (path, bin) in files {
-                if self.cancelled() {
+            files.extend(self.files(path, &mut budget));
+        }
+        self.progress.total.store(files.len() as u64, Ordering::Relaxed);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let opened = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..self.limit.min(files.len()) {
+                let run = || self.open_next(&files, &next, &opened);
+                if std::thread::Builder::new().name("filmcraft-open".into()).spawn_scoped(scope, run).is_err() {
+                    // If a thread cannot be started, this worker drains the same queue.
+                    self.open_next(&files, &next, &opened);
                     break;
                 }
-                self.open_one(path, bin);
+            }
+        });
+        let mut opened = lock(&opened);
+        opened.sort_by_key(|(index, _)| *index);
+        let mut results = lock(&self.results);
+        for (_, result) in opened.drain(..) {
+            match result {
+                Ok(file) => results.opened.push(file),
+                Err(error) => results.errors.push(error),
             }
         }
+        drop(results);
         let n = lock(&self.results).opened.len();
         *lock(&self.progress.status) = if self.cancelled() {
             format!("Stopped: committing {n} already opened file(s)")
@@ -206,25 +247,34 @@ impl Worker {
         files
     }
 
-    fn open_one(&self, path: String, bin: Option<usize>) {
-        let began = web_time::Instant::now();
-        let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.clone());
-        *lock(&self.current) = Some((name.clone(), began));
-        *lock(&self.progress.status) = format!("{name} (0 s)");
-        // One container open cannot be interrupted. Cancellation is checked between files.
-        match self.open(&path, name, bin, began) {
-            Ok(opened) => {
-                *lock(&self.progress.status) = format!("{} ({:.0} s)", opened.name, opened.seconds);
-                lock(&self.results).opened.push(opened);
+    fn open_next(&self, files: &[(String, Option<usize>)], next: &std::sync::atomic::AtomicUsize, opened: &IndexedOpens) {
+        while !self.cancelled() {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            let Some((path, bin)) = files.get(index) else { break };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.open_one(index, path, *bin)))
+                .unwrap_or_else(|_| Err(format!("{path}: the file could not be opened (internal error)")));
+            lock(opened).push((index, result));
+            let mut current = lock(&self.current);
+            current.retain(|(i, _, _)| *i != index);
+            if let Some(status) = current_status(&current) {
+                *lock(&self.progress.status) = status;
             }
-            Err(e) => {
-                let seconds = began.elapsed().as_secs_f64();
-                *lock(&self.progress.status) = format!("{path} ({seconds:.0} s)");
-                lock(&self.results).errors.push(format!("{path}: {e} ({seconds:.1} s)"));
+            self.progress.done.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn open_one(&self, index: usize, path: &str, bin: Option<usize>) -> std::result::Result<Opened, String> {
+        let began = web_time::Instant::now();
+        let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
+        {
+            let mut current = lock(&self.current);
+            current.push((index, name.clone(), began));
+            if let Some(status) = current_status(&current) {
+                *lock(&self.progress.status) = status;
             }
         }
-        *lock(&self.current) = None;
-        self.progress.done.fetch_add(1, Ordering::Relaxed);
+        // One container open cannot be interrupted. Cancellation is checked between files.
+        self.open(path, name, bin).map_err(|e| format!("{path}: {e} ({:.1} s)", began.elapsed().as_secs_f64()))
     }
 
     fn folder(&self, folder: crate::media_browser::Folder, parent: Option<usize>, files: &mut Vec<(String, Option<usize>)>) {
@@ -238,7 +288,7 @@ impl Worker {
         }
     }
 
-    fn open(&self, path: &str, name: String, bin: Option<usize>, began: web_time::Instant) -> Result<Opened> {
+    fn open(&self, path: &str, name: String, bin: Option<usize>) -> Result<Opened> {
         let streamed = filmcraft_media::is_importable(std::path::Path::new(path)) && self.services.reader(path).is_some();
         let (identity, source) = if streamed {
             let identity = crate::relink::identity_of(&*self.services, path).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
@@ -247,7 +297,7 @@ impl Worker {
             let bytes: Arc<[u8]> = self.services.read_file(path).map_err(|e| EngineError::Other(e.to_string()))?.into();
             (crate::relink::identity_of_bytes(&bytes), self.media.open_bytes(&name, bytes)?)
         };
-        Ok(Opened { path: path.into(), name, identity, source, bin, seconds: began.elapsed().as_secs_f64() })
+        Ok(Opened { path: path.into(), name, identity, source, bin })
     }
 }
 
@@ -258,9 +308,9 @@ pub fn poll(s: &mut Session) {
         let pending = &s.import_jobs[i];
         let job = s.jobs.iter().find(|j| j.id == pending.job);
         if job.is_some_and(|j| !j.progress.finished.load(Ordering::Acquire)) {
-            if let Some((name, began)) = lock(&pending.current).as_ref() {
+            if let Some(status) = current_status(&lock(&pending.current)) {
                 if let Some(job) = job {
-                    *lock(&job.progress.status) = format!("{name} ({} s)", began.elapsed().as_secs());
+                    *lock(&job.progress.status) = status;
                 }
             }
             i += 1;
@@ -385,4 +435,32 @@ pub(crate) fn status(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.import_results = remaining;
     Ok(json!({"pending": pending, "jobs": jobs, "outcomes": outcomes}))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn open_threads_precedence_clamping_and_hostile_values() {
+        for (params, environment, expected) in [
+            (json!({}), None, super::OPEN_CONCURRENCY),
+            (json!({}), Some("3"), 3),
+            (json!({}), Some("0"), 1),
+            (json!({}), Some("-5"), 1),
+            (json!({}), Some("99"), 16),
+            (json!({}), Some("invalid"), super::OPEN_CONCURRENCY),
+            (json!({"openThreads": 2}), Some("8"), 2),
+            (json!({"openThreads": -1}), Some("8"), 1),
+            (json!({"openThreads": 0}), None, 1),
+            (json!({"openThreads": u64::MAX}), None, 16),
+            (json!({"openThreads": 2.5}), Some("3"), 3),
+            (json!({"openThreads": false}), Some("3"), 3),
+            (json!({"openThreads": []}), None, super::OPEN_CONCURRENCY),
+            (json!({"openThreads": "4"}), None, super::OPEN_CONCURRENCY),
+            (json!(null), None, super::OPEN_CONCURRENCY),
+        ] {
+            assert_eq!(super::open_limit(&params, environment), expected);
+        }
+    }
 }
