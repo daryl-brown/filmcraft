@@ -16,6 +16,7 @@ const VALUED: &[&str] = &[
     "--seconds",
     "--out",
     "--frames",
+    "--workers",
     "--preset",
     "--range",
     "--start",

@@ -96,7 +96,8 @@ SUBCOMMANDS
   probe <media> [--image-sequence]
                                 media info as JSON, with MXF / Ogg / BWF details; with
                                 --image-sequence <media> is the first numbered still of a sequence
-  bench-decode <media> [--frames N]
+  bench-decode <media> [--frames N] [--start F] [--workers N]
+                                workers request different frames at once
   mcp                           MCP server on stdio (headless, or --bridge to the live app)
   help                          this text
   --version                     print the version
@@ -337,21 +338,86 @@ async fn cli_probe(a: &Args) {
     }
 }
 
+fn bench_decode_requests(
+    src: &filmcraft_media::SharedSource,
+    rate: filmcraft_time::FrameRate,
+    range: std::ops::Range<i64>,
+    workers: usize,
+) -> Vec<(std::time::Instant, std::time::Duration)> {
+    use std::sync::{Mutex, PoisonError, atomic::AtomicI64};
+    use std::time::Instant;
+
+    let mut samples = Vec::new();
+    let count = usize::try_from(range.end - range.start).unwrap_or_else(|e| fail(e));
+    samples.try_reserve_exact(count).unwrap_or_else(|e| fail(e));
+    let samples = Mutex::new(samples);
+    let next = AtomicI64::new(range.start);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let _worker = std::thread::Builder::new().spawn_scoped(scope, || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Ok(f) = next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| {
+                        if f < range.end { Some(f + 1) } else { None }
+                    }) {
+                        let started = Instant::now();
+                        let frame = src.video_frame(filmcraft_media::FrameRequest::full(rate.tick_of(f)))
+                            .unwrap_or_else(|e| fail(e));
+                        let elapsed = started.elapsed();
+                        drop(frame);
+                        samples.lock().unwrap_or_else(PoisonError::into_inner).push((started, elapsed));
+                    }
+                }));
+                if result.is_err() {
+                    fail("bench-decode worker panicked");
+                }
+            }).unwrap_or_else(|e| fail(e));
+        }
+    });
+    samples.into_inner().unwrap_or_else(PoisonError::into_inner)
+}
+
 async fn cli_bench_decode(a: &Args) {
-    let path = a.pos(1).unwrap_or_else(|| usage("bench-decode <media>"));
-    let n: i64 = a.opt("--frames").and_then(|v| v.parse().ok()).unwrap_or(120);
+    let path = a.pos(1).unwrap_or_else(|| usage("bench-decode <media> [--frames N] [--start F] [--workers N]"));
+    for option in ["--frames", "--start", "--workers"] {
+        if a.flag(option) && a.opt(option).is_none() {
+            usage(format!("{option} needs a value"));
+        }
+    }
+    let n: i64 = a.opt("--frames").unwrap_or("120").parse().unwrap_or_else(|_| usage("--frames must be a positive integer"));
+    let start: i64 = a.opt("--start").unwrap_or("0").parse().unwrap_or_else(|_| usage("--start must be a non-negative integer"));
+    let workers: usize = a.opt("--workers").unwrap_or("1").parse().unwrap_or_else(|_| usage("--workers must be a positive integer"));
+    if n <= 0 || start < 0 || workers == 0 {
+        usage("--frames and --workers must be positive; --start must be non-negative");
+    }
+    let end = start.checked_add(n).unwrap_or_else(|| usage("frame range is too large"));
+    #[cfg(any(unix, windows))]
+    let src = {
+        let path = std::path::Path::new(path);
+        let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+        let reader: filmcraft_media::SharedReader = std::sync::Arc::new(
+            filmcraft_media::reader::FileReader::open(path).unwrap_or_else(|e| fail(e)),
+        );
+        filmcraft_media::reader::open_reader(&name, reader, &filmcraft_codecs::reader_openers(), &filmcraft_codecs::openers())
+            .unwrap_or_else(|e| fail(e))
+    };
+    #[cfg(not(any(unix, windows)))]
     let src = filmcraft_codecs::open_bytes(path, read_file(path).await.unwrap_or_else(|e| fail(e)).into()).unwrap_or_else(|e| fail(e));
     let rate = src.info().frame_rate();
     let t0 = std::time::Instant::now();
-    for f in 0..n {
-        src.video_frame(filmcraft_media::FrameRequest::full(rate.tick_of(f))).unwrap_or_else(|e| fail(e));
-    }
+    let mut samples = bench_decode_requests(&src, rate, start..end, workers);
     let dt = t0.elapsed().as_secs_f64();
-    outln!("{n} frames in {dt:.2}s → {:.1} fps (sequential, via Mp4Source)", n as f64 / dt);
+    outln!("{n} frames in {dt:.2}s, {:.1} fps, {workers} workers", n as f64 / dt.max(f64::MIN_POSITIVE));
+    let first = samples.iter().min_by_key(|s| s.0).map(|s| s.1).unwrap_or_default();
+    samples.sort_unstable_by_key(|s| s.1);
+    let ms = |i| samples.get(i).map(|s| s.1.as_secs_f64() * 1000.0).unwrap_or_default();
+    let middle = samples.len() / 2;
+    let median = if samples.len() % 2 == 0 { (ms(middle - 1) + ms(middle)) / 2.0 } else { ms(middle) };
+    outln!("request latency ms: first {:.1}, min {:.1}, median {median:.1}, max {:.1}", first.as_secs_f64() * 1000.0, ms(0), ms(samples.len().saturating_sub(1)));
     let t1 = std::time::Instant::now();
-    let f = src.video_frame(filmcraft_media::FrameRequest::full(rate.tick_of(n / 2))).unwrap_or_else(|e| fail(e));
+    let f = src.video_frame(filmcraft_media::FrameRequest::full(rate.tick_of(start + n / 2))).unwrap_or_else(|e| fail(e));
     let (w, h, _) = f.to_linear_f32_decimated(2);
-    outln!("½-res linear conversion {w}x{h}: {:.1} ms", t1.elapsed().as_secs_f64() * 1000.0);
+    drop(f);
+    outln!("half-res linear conversion {w}x{h}: {:.1} ms", t1.elapsed().as_secs_f64() * 1000.0);
 }
 
 async fn cli_commands(a: &Args, cmd: &str) {

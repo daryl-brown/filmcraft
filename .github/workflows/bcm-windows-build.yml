@@ -89,6 +89,16 @@ jobs:
           . ./.github/scripts/ci-logged.ps1
           Invoke-Logged -Title 'cargo test h264' -Command { cargo test --locked -p filmcraft-h264 --target $env:TARGET --message-format short }
 
+      - name: Test H.264 independent-sample decoding in the GOP cache (debug, locked)
+        shell: pwsh
+        env:
+          # A missing ffmpeg must fail the run, not skip the oracle tests.
+          FILMCRAFT_REQUIRE_ORACLES: "1"
+        run: |
+          . ./.github/scripts/ci-logged.ps1
+          Invoke-Logged -Title 'cargo test codecs h264_intra' -Command { cargo test --locked -p filmcraft-codecs --test h264_intra --target $env:TARGET --message-format short }
+          Invoke-Logged -Title 'cargo test codecs gop' -Command { cargo test --locked -p filmcraft-codecs --lib gop:: --target $env:TARGET --message-format short }
+
       - name: Build (release, locked, whisper enabled)
         shell: pwsh
         env:
