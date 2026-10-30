@@ -31,7 +31,7 @@ pub struct ImportOutcome {
     pub items: Vec<ItemId>,
     pub errors: Vec<String>,
     pub bins: Vec<u64>,
-    /// Sidecars skipped by the shared folder walker.
+    /// Listed non-media files skipped by the shared folder walker, excluding unvisited thumbnail folders.
     pub skipped: u64,
 }
 
@@ -371,6 +371,15 @@ impl Worker {
     }
 }
 
+fn refresh_import_label(job: &mut crate::Job) {
+    let count = job.label.strip_prefix("Opening ").and_then(|label| label.strip_suffix(" files").or_else(|| label.strip_suffix(" file")));
+    let count = count.filter(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit())).and_then(|count| count.parse::<u64>().ok());
+    let total = job.progress.total.load(Ordering::Relaxed);
+    if total > 0 && count.is_some_and(|count| count != total) {
+        job.label = format!("Opening {total} file{}", if total == 1 { "" } else { "s" });
+    }
+}
+
 /// Apply finished workers on the session thread, including the files opened before cancellation.
 pub fn poll(s: &mut Session) {
     let mut i = 0;
@@ -382,6 +391,11 @@ pub fn poll(s: &mut Session) {
                 if let Some(job) = job {
                     *lock(&job.progress.status) = status;
                 }
+            }
+            if pending.deferred.is_none()
+                && let Some(job) = s.jobs.iter_mut().find(|j| j.id == pending.job)
+            {
+                refresh_import_label(job);
             }
             i += 1;
             continue;

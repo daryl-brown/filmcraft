@@ -345,6 +345,45 @@ pub(crate) fn folder_fixture() -> FakeFs {
     fs
 }
 
+pub(crate) fn thumbnail_fixture(name: &str) -> FakeFs {
+    let mut fs = folder_fixture();
+    fs.dirs = vec!["/XDROOT".into(), "/XDROOT/Clip".into(), format!("/XDROOT/{name}")];
+    let files = fs.files.get_mut().unwrap();
+    let wav = files.get("/outside.wav").unwrap().clone();
+    let png = files.get("/root/B/b1.png").unwrap().clone();
+    files.clear();
+    files.insert("/XDROOT/Clip/a.wav".into(), wav);
+    files.insert(format!("/XDROOT/{name}/a.png"), png);
+    files.insert(format!("/XDROOT/{name}/notes.srt"), b"sidecar".to_vec());
+    fs
+}
+
+#[test]
+fn folder_import_ignores_thumbnail_subfolders_but_accepts_explicit_paths() {
+    for name in ["Thmbnl", "tHmBnL"] {
+        for command in ["file.import", "mediaBrowser.import"] {
+            for (path, item, bins, skipped) in [
+                ("/XDROOT".to_string(), "a.wav", 2, 0),
+                (format!("/XDROOT/{name}"), "a.png", 1, 1),
+                (format!("/XDROOT/{name}/a.png"), "a.png", 0, 0),
+            ] {
+                let mut s = Session::new(Arc::new(thumbnail_fixture(name)));
+                let out = s.execute(command, json!({"paths": [path]})).unwrap();
+                assert_eq!(out["items"].as_array().unwrap().len(), 1);
+                assert_eq!(s.project.items.values().next().unwrap().name, item);
+                assert_eq!(out["errors"], json!([]));
+                assert_eq!(out["skipped"], skipped);
+                assert_eq!(out["bins"].as_array().map_or(0, Vec::len), bins);
+                if item == "a.wav" {
+                    let root = child_bin(&s.project.root, "XDROOT");
+                    assert_eq!(root.children.len(), 1);
+                    assert_eq!(bin_items(&s, child_bin(root, "Clip")), ["a.wav"]);
+                }
+            }
+        }
+    }
+}
+
 fn child_bin<'a>(bin: &'a filmcraft_project::Bin, name: &str) -> &'a filmcraft_project::Bin {
     bin.children
         .iter()
