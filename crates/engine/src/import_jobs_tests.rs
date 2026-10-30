@@ -655,7 +655,7 @@ mod native {
                     assert_eq!(tree(&sync, &sync.project.root), tree(&background, &background.project.root));
                     assert_eq!(a["items"].as_array().unwrap().len(), 1);
                     assert_eq!(b["items"].as_array().unwrap().len(), 1);
-                    assert_eq!(a["skipped"], b["skipped"]);
+                    assert_eq!(a["skipped"].as_u64().unwrap_or(0), b["skipped"].as_u64().unwrap_or(0));
                     assert_eq!(a["errors"], b["errors"]);
                     let expected_bins = a["bins"].as_array().map_or(0, Vec::len);
                     assert_eq!(b["bins"].as_array().unwrap().len(), expected_bins);

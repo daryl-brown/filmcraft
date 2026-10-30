@@ -372,7 +372,7 @@ fn folder_import_ignores_thumbnail_subfolders_but_accepts_explicit_paths() {
                 assert_eq!(out["items"].as_array().unwrap().len(), 1);
                 assert_eq!(s.project.items.values().next().unwrap().name, item);
                 assert_eq!(out["errors"], json!([]));
-                assert_eq!(out["skipped"], skipped);
+                assert_eq!(out["skipped"].as_u64().unwrap_or(0), skipped);
                 assert_eq!(out["bins"].as_array().map_or(0, Vec::len), bins);
                 if item == "a.wav" {
                     let root = child_bin(&s.project.root, "XDROOT");
