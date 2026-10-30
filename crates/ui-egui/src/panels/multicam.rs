@@ -335,7 +335,7 @@ pub fn grid(app: &mut FilmcraftApp, ui: &mut egui::Ui, area: Rect) {
     let mt = Tick(info["sourceTime"].as_i64().unwrap_or(0));
     let frame = rate.frame_at(mt);
     let target = Target::MulticamGrid(src, view.layout.unwrap_or(0) as u8, lay.page as u16);
-    let key = FrameKey { target, frame, size: (scale * 1000.0) as u32, revision: grid_revision(app, src), draft: false };
+    let key = FrameKey { target, frame, size: (scale * 1000.0) as u32, revision: grid_revision(app, src), draft: false, lite: false };
     let project = app.session.project.clone();
     if app.playback.playing {
         app.frames.schedule_playback(key, rate, scale, &project, app.playback.speed, app.playback.preroll.is_some());
@@ -449,7 +449,7 @@ pub fn show_edit_cameras(app: &mut FilmcraftApp, ctx: &egui::Context) {
     let mut thumbs = Vec::new();
     for a in 0..d.names.len() {
         let has_video = q.angle_video_track_index(a).is_some();
-        let key = FrameKey { target: Target::MulticamAngle(src, a as u32), frame, size: (scale * 1000.0) as u32, revision: rev, draft: false };
+        let key = FrameKey { target: Target::MulticamAngle(src, a as u32), frame, size: (scale * 1000.0) as u32, revision: rev, draft: false, lite: false };
         let tex = if has_video {
             app.frames.request(key, rate.tick_of(frame), scale, &project, 2);
             app.frames.get(&key).map(|img| app.texture_for(ctx, &format!("edit-cameras-{}-{a}", src.0), key, &img))

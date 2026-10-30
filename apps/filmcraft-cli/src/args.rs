@@ -130,10 +130,10 @@ mod tests {
 
     #[test]
     fn bench_render_and_scale_options() {
-        let a = args("bench-decode clip.mov --scale 0.5 --render");
+        let a = args("bench-decode clip.mov --scale 0.5 --render --lite --psnr");
         assert_eq!(a.positionals, ["bench-decode", "clip.mov"]);
         assert_eq!(a.opt("--scale"), Some("0.5"));
-        assert!(a.flag("--render"));
+        assert!(a.flag("--render") && a.flag("--lite") && a.flag("--psnr"));
         let missing = args("bench-decode clip.mov --render --scale");
         assert!(missing.flag("--scale"));
         assert_eq!(missing.opt("--scale"), None);

@@ -96,9 +96,10 @@ SUBCOMMANDS
   probe <media> [--image-sequence]
                                 media info as JSON, with MXF / Ogg / BWF details; with
                                 --image-sequence <media> is the first numbered still of a sequence
-  bench-decode <media> [--frames N] [--start F] [--workers N] [--render] [--scale F]
+  bench-decode <media> [--frames N] [--start F] [--workers N] [--render] [--scale F] [--lite] [--psnr]
                                 workers request different frames at once
                                 --render measures the Source monitor path; --scale 0.03125..=1.0 (default 1.0) applies with --render
+                                --lite uses lighter colour conversion; --psnr compares exact and lite RGB (requires --render, one worker)
   mcp                           MCP server on stdio (headless, or --bridge to the live app)
   help                          this text
   --version                     print the version
@@ -407,7 +408,54 @@ fn bench_latency(mut samples: Vec<(std::time::Instant, std::time::Duration)>) {
     outln!("request latency ms: first {:.1}, min {:.1}, median {median:.1}, max {:.1}", first.as_secs_f64() * 1000.0, ms(0), ms(samples.len().saturating_sub(1)));
 }
 
-fn bench_render(path: &str, range: std::ops::Range<i64>, workers: usize, scale: f32) -> Result<(), String> {
+fn bench_decode_flags(a: &Args) -> Result<(), String> {
+    if a.flag("--psnr") && !a.flag("--render") {
+        return Err("--psnr requires --render".into());
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct PsnrStats {
+    count: usize,
+    sum: f64,
+    worst: Option<(f64, i64)>,
+    max_diff: u8,
+}
+
+impl PsnrStats {
+    fn add(&mut self, frame: i64, exact: &[u8], lite: &[u8]) {
+        let mut squared = 0.0;
+        let mut samples = 0usize;
+        for (a, b) in exact.chunks_exact(4).zip(lite.chunks_exact(4)) {
+            for (&x, &y) in a.iter().zip(b).take(3) {
+                let diff = x.abs_diff(y);
+                self.max_diff = self.max_diff.max(diff);
+                squared += f64::from(diff).powi(2);
+                samples += 1;
+            }
+        }
+        if squared == 0.0 || samples == 0 {
+            return;
+        }
+        let db = 10.0 * (255.0f64.powi(2) / (squared / samples as f64)).log10();
+        self.count += 1;
+        self.sum += db;
+        if self.worst.is_none_or(|(min, _)| db < min) {
+            self.worst = Some((db, frame));
+        }
+    }
+
+    fn print(&self) {
+        if let Some((min, frame)) = self.worst {
+            outln!("psnr dB: min {min:.3}, mean {:.3}, worst frame {frame}, max abs diff {}", self.sum / self.count as f64, self.max_diff);
+        } else {
+            outln!("psnr dB: identical");
+        }
+    }
+}
+
+fn bench_render(path: &str, range: std::ops::Range<i64>, workers: usize, scale: f32, lite: bool, psnr: bool) -> Result<(), String> {
     // A headless session has no persistence or watcher. Keep per-user libraries unconfigured.
     let mut session = Session::default();
     let imported = session.execute("file.import", json!({"paths": [absolute(path)], "background": false})).map_err(|e| e.to_string())?;
@@ -418,11 +466,21 @@ fn bench_render(path: &str, range: std::ops::Range<i64>, workers: usize, scale: 
     let provider = session.media.provider(session.project.clone(), session.services.clone());
     let n = range.end - range.start;
     let t0 = std::time::Instant::now();
+    let quality = std::sync::Mutex::new(PsnrStats::default());
+    let render = if lite { filmcraft_render::render_item_lite } else { filmcraft_render::render_item };
     let samples = bench_decode_requests(
         |f| {
-            let image = filmcraft_render::render_item(&project, item, rate.tick_of(f), scale, &provider)
-                .ok_or_else(|| format!("could not render item {id} at frame {f}"))?;
-            drop(image.over_black_with_alpha_rgba8());
+            let image = render(&project, item, rate.tick_of(f), scale, &provider).ok_or_else(|| format!("could not render item {id} at frame {f}"))?;
+            let bytes = image.over_black_with_alpha_rgba8();
+            if psnr {
+                let other_render = if lite { filmcraft_render::render_item } else { filmcraft_render::render_item_lite };
+                let other = other_render(&project, item, rate.tick_of(f), scale, &provider).ok_or("could not render comparison frame")?;
+                if (image.w, image.h) != (other.w, other.h) {
+                    return Err("exact and lite dimensions differ".into());
+                }
+                quality.lock().unwrap_or_else(std::sync::PoisonError::into_inner).add(f, &bytes, &other.over_black_with_alpha_rgba8());
+            }
+            drop(bytes);
             Ok(())
         },
         range,
@@ -431,11 +489,15 @@ fn bench_render(path: &str, range: std::ops::Range<i64>, workers: usize, scale: 
     let dt = t0.elapsed().as_secs_f64();
     outln!("{n} frames in {dt:.2}s, {:.1} fps, {workers} workers, render item scale {scale}", n as f64 / dt.max(f64::MIN_POSITIVE));
     bench_latency(samples);
+    if psnr {
+        quality.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner).print();
+    }
     Ok(())
 }
 
 async fn cli_bench_decode(a: &Args) {
-    let path = a.pos(1).unwrap_or_else(|| usage("bench-decode <media> [--frames N] [--start F] [--workers N] [--render] [--scale F]"));
+    let path = a.pos(1).unwrap_or_else(|| usage("bench-decode <media> [--frames N] [--start F] [--workers N] [--render] [--scale F] [--lite] [--psnr]"));
+    bench_decode_flags(a).unwrap_or_else(|e| usage(e));
     let scale = bench_decode_scale(a).unwrap_or_else(|e| usage(e));
     for option in ["--frames", "--start", "--workers"] {
         if a.flag(option) && a.opt(option).is_none() {
@@ -450,7 +512,8 @@ async fn cli_bench_decode(a: &Args) {
     }
     let end = start.checked_add(n).unwrap_or_else(|| usage("frame range is too large"));
     if a.flag("--render") {
-        bench_render(path, start..end, workers, scale).unwrap_or_else(|e| fail(e));
+        let workers = if a.flag("--psnr") { 1 } else { workers };
+        bench_render(path, start..end, workers, scale, a.flag("--lite"), a.flag("--psnr")).unwrap_or_else(|e| fail(e));
         return;
     }
     #[cfg(any(unix, windows))]
@@ -884,5 +947,28 @@ mod format_tests {
         assert_eq!(super::format_for("out/clip.MXF"), Some("mxf-op1a"));
         assert_eq!(super::format_for("a.mov"), Some("prores"));
         assert_eq!(super::format_for("noext"), None);
+    }
+}
+
+#[cfg(test)]
+mod lite_bench_tests {
+    use super::{Args, PsnrStats, bench_decode_flags};
+
+    #[test]
+    fn psnr_requires_render() {
+        let args = |s: &str| Args::parse(s.split_whitespace().map(str::to_string));
+        assert!(bench_decode_flags(&args("bench-decode clip.mov --psnr")).is_err());
+        assert!(bench_decode_flags(&args("bench-decode clip.mov --render --lite --psnr")).is_ok());
+    }
+
+    #[test]
+    fn psnr_ignores_alpha_and_identical_frames() {
+        let mut stats = PsnrStats::default();
+        stats.add(0, &[0, 0, 0, 255], &[0, 0, 0, 0]);
+        assert_eq!(stats.count, 0);
+        stats.add(1, &[0, 0, 0, 255], &[1, 1, 1, 255]);
+        assert!((stats.sum - 48.1308).abs() < 0.001);
+        assert_eq!(stats.worst.unwrap().1, 1);
+        assert_eq!(stats.max_diff, 1);
     }
 }

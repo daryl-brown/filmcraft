@@ -103,7 +103,7 @@ impl FilmcraftApp {
         let rate = pi.frame_rate();
         let frame = rate.frame_at(t);
         let rev = self.item_revision(item);
-        let key = FrameKey { target: Target::Item(item), frame, size: width, revision: rev, draft: false };
+        let key = FrameKey { target: Target::Item(item), frame, size: width, revision: rev, draft: false, lite: false };
         let name = format!("thumb-{}-{}-{}", item.0, frame, width);
         if let Some(img) = self.frames.get(&key) {
             let id = self.texture_for(ctx, &name, key, &img);

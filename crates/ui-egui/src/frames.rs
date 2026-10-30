@@ -67,6 +67,8 @@ pub struct FrameKey {
     /// ([`filmcraft_media::cancel::with_draft`]). Draft frames have their own keys, so a paused
     /// monitor, an export or a render never shows one.
     pub draft: bool,
+    /// Colour conversion after planar reduction, isolated from exact requests.
+    pub lite: bool,
 }
 
 /// Whether a monitor frame is requested with draft decoding ([`FrameKey::draft`]): only while
@@ -726,7 +728,7 @@ impl FrameServer {
     /// The most recent cached frame for `target` at or before `frame` within `max_back` frames.
     pub fn nearest(&self, target: Target, frame: i64, size: u32, revision: u64, max_back: i64) -> Option<Arc<Rgba>> {
         for d in 0..=max_back {
-            if let Some(v) = self.get(&FrameKey { target, frame: frame - d, size, revision, draft: false }) {
+            if let Some(v) = self.get(&FrameKey { target, frame: frame - d, size, revision, draft: false, lite: false }) {
                 return Some(v);
             }
         }
@@ -1068,6 +1070,7 @@ fn render_job(job: &Job, pool: &Arc<MediaPool>, services: &Arc<dyn Services>, pr
         Target::Sequence(seq) | Target::SequencePlan(seq) | Target::SequenceLive(seq) => {
             Some(filmcraft_render::render_sequence(&job.project, seq, job.time, opts, &provider))
         }
+        Target::Item(item) if job.key.lite => filmcraft_render::render_item_lite(&job.project, item, job.time, job.scale, &provider),
         Target::Item(item) => filmcraft_render::render_item(&job.project, item, job.time, job.scale, &provider),
         Target::MulticamGrid(item, side, page) => {
             let side = (side > 0).then_some(side as usize);
@@ -1198,7 +1201,7 @@ mod tests {
         let s = filmcraft_engine::Session::default();
         let server = FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 3);
         let p = Arc::new(filmcraft_project::Project::new("Frames"));
-        let key = FrameKey { target: Target::Item(ItemId(999)), frame: 0, size: 32, revision: 0, draft: false };
+        let key = FrameKey { target: Target::Item(ItemId(999)), frame: 0, size: 32, revision: 0, draft: false, lite: false };
         server.request(key, filmcraft_time::Tick::ZERO, 0.1, &p, 0);
         let (shared, project) = (Arc::downgrade(&server.shared), Arc::downgrade(&p));
         drop(p);
@@ -1211,6 +1214,32 @@ mod tests {
         assert_eq!(project.strong_count(), 0, "a queued job still holds its project");
     }
 
+    #[test]
+    fn lite_item_jobs_cache_only_under_the_lite_key() {
+        use super::{FrameKey, FrameServer, Job, run_job};
+        use std::sync::Arc;
+
+        let s = filmcraft_engine::Session::default();
+        let server = FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 1);
+        let mut project = filmcraft_project::Project::new("Frames");
+        let item = project.new_sequence("Source", filmcraft_project::SequenceSettings { width: 64, height: 32, ..Default::default() }, 1, 0, None);
+        let key = FrameKey { target: Target::Item(item), frame: 0, size: 500, revision: 0, draft: false, lite: true };
+        let job = Job {
+            key,
+            queued: web_time::Instant::now(),
+            cancel: Default::default(),
+            prefetch: false,
+            catch_up: None,
+            time: filmcraft_time::Tick::ZERO,
+            scale: 0.5,
+            project: Arc::new(project),
+            prio: 0,
+        };
+        run_job(&server.shared, &job, &server.pool, &server.services, &server.previews);
+        assert!(server.get(&key).is_some());
+        assert!(server.get(&FrameKey { lite: false, ..key }).is_none());
+    }
+
     /// A job a worker took from the queue before the server was dropped runs cancelled.
     #[test]
     fn a_job_started_after_the_drop_is_cancelled() {
@@ -1221,7 +1250,7 @@ mod tests {
         let s = filmcraft_engine::Session::default();
         let server = FrameServer::new(s.media.clone(), s.services.clone(), s.previews.clone(), 1);
         let job = Job {
-            key: FrameKey { target: Target::Item(ItemId(999)), frame: 0, size: 32, revision: 0, draft: false },
+            key: FrameKey { target: Target::Item(ItemId(999)), frame: 0, size: 32, revision: 0, draft: false, lite: false },
             queued: web_time::Instant::now(),
             cancel: Default::default(),
             prefetch: false,
