@@ -446,7 +446,9 @@ pub(crate) fn is_folder(services: &dyn Services, path: &str) -> bool {
 }
 
 /// The files the browser shows in `dir` and its sub-folders, as a tree; `None` when the tree
-/// holds none (or `budget` folders were walked already).
+/// holds none (or `budget` folders were walked already). Sub-folders named `Thmbnl` (ASCII
+/// case-insensitive) are not visited; a root with that name is still walked. `skipped` counts
+/// listed non-media files, excluding unknown extensions and files in unvisited folders.
 pub(crate) fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budget: &mut usize, skipped: &mut u64) -> Option<Folder> {
     *budget = budget.checked_sub(1)?;
     let entries = list(services, dir, "all").ok()?;
@@ -459,7 +461,7 @@ pub(crate) fn walk_folder(services: &dyn Services, dir: &str, depth: usize, budg
                 // Unknown extensions are not listed by `list`, so they are not counted.
                 *skipped = skipped.saturating_add(1);
             }
-        } else if depth < FOLDER_IMPORT_MAX_DEPTH
+        } else if !e.name.eq_ignore_ascii_case("Thmbnl") && depth < FOLDER_IMPORT_MAX_DEPTH
             && let Some(sub) = walk_folder(services, &e.path, depth + 1, budget, skipped)
         {
             folder.subs.push(sub);

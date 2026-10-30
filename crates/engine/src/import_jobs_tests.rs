@@ -197,6 +197,8 @@ mod native {
             assert_eq!(out["pending"], true);
             assert_eq!(out["files"], 6);
             fs.wait_for(threads);
+            let status = s.execute("file.importStatus", json!({"job": out["job"]})).unwrap();
+            assert_eq!(status["jobs"][0]["label"], "Opening 6 files for Link Media");
             assert_eq!(s.offline.missing, items);
             for (item, path) in items.iter().zip(&paths) {
                 assert_eq!(s.project.item(*item).unwrap().as_media().unwrap().media, MediaRef::File { path: format!("/missing{path}") });
@@ -549,6 +551,27 @@ mod native {
     }
 
     #[test]
+    fn running_import_labels_follow_the_walk_total_only_for_plain_imports() {
+        for (path, label, expected) in [
+            ("/root", "Opening 1 file", "Opening 3 files"),
+            ("/outside.wav", "Opening 1 file", "Opening 1 file"),
+            ("/root", "Opening 1 file for Link Media", "Opening 1 file for Link Media"),
+            ("/root", "Opening media", "Opening media"),
+        ] {
+            let (mut s, gate) = gated_path(if path == "/root" { "/root/A/a1.wav" } else { path });
+            let out = s.execute("file.import", json!({"paths": [path], "background": true, "openThreads": 1})).unwrap();
+            let id = out["job"].as_u64().unwrap();
+            gate.entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            s.jobs.iter_mut().find(|job| job.id == id).unwrap().label = label.into();
+            let status = s.execute("file.importStatus", json!({"job": id})).unwrap();
+            assert_eq!(status["jobs"][0]["label"], expected);
+            assert_eq!(s.jobs.iter().find(|job| job.id == id).unwrap().label, expected);
+            gate.release.send(()).unwrap();
+            wait(&mut s, id);
+        }
+    }
+
+    #[test]
     fn background_folder_walk_returns_before_listing() {
         let (mut s, gate) = gated_path("/root");
         let began = Instant::now();
@@ -616,6 +639,29 @@ mod native {
         }).collect();
         children.sort_by_key(Value::to_string);
         json!({"bin": bin.name, "children": children})
+    }
+
+    #[test]
+    fn background_thumbnail_folder_filter_matches_sync() {
+        for name in ["Thmbnl", "tHmBnL"] {
+            for command in ["file.import", "mediaBrowser.import"] {
+                for path in ["/XDROOT".to_string(), format!("/XDROOT/{name}"), format!("/XDROOT/{name}/a.png")] {
+                    let mut sync = Session::new(Arc::new(crate::media_browser_tests::thumbnail_fixture(name)));
+                    let mut background = Session::new(Arc::new(crate::media_browser_tests::thumbnail_fixture(name)));
+                    let a = sync.execute(command, json!({"paths": [path]})).unwrap();
+                    let started = background.execute(command, json!({"paths": [path], "background": true})).unwrap();
+                    let done = wait(&mut background, started["job"].as_u64().unwrap());
+                    let b = &done["outcomes"][0];
+                    assert_eq!(tree(&sync, &sync.project.root), tree(&background, &background.project.root));
+                    assert_eq!(a["items"].as_array().unwrap().len(), 1);
+                    assert_eq!(b["items"].as_array().unwrap().len(), 1);
+                    assert_eq!(a["skipped"], b["skipped"]);
+                    assert_eq!(a["errors"], b["errors"]);
+                    let expected_bins = a["bins"].as_array().map_or(0, Vec::len);
+                    assert_eq!(b["bins"].as_array().unwrap().len(), expected_bins);
+                }
+            }
+        }
     }
 
     #[test]
