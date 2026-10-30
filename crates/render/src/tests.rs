@@ -534,3 +534,88 @@ fn a_reversed_clip_shows_exactly_its_source_range() {
     let all: Vec<i64> = (0..20).flat_map(|f| shown(&p, f, false)).collect();
     assert_eq!(all, (10..=29).rev().collect::<Vec<_>>());
 }
+
+struct LiteFrameSource {
+    info: filmcraft_media::MediaInfo,
+    frame: Arc<VideoFrame>,
+}
+
+impl MediaSource for LiteFrameSource {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        &self.info
+    }
+
+    fn video_frame(&self, _req: FrameRequest) -> filmcraft_media::Result<Arc<VideoFrame>> {
+        Ok(self.frame.clone())
+    }
+
+    fn audio(&self, _start: i64, _frames: usize, _sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        Err(filmcraft_media::MediaError::NoStream("audio"))
+    }
+}
+
+fn lite_yuv_frame() -> VideoFrame {
+    let mut seed = 12345u32;
+    let mut plane = |w: usize, base: u16, slope: u16| {
+        Arc::new(
+            (0..w * 64)
+                .map(|i| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    base + (i % w) as u16 * slope + (i / w) as u16 + ((seed >> 28) as u16)
+                })
+                .collect(),
+        )
+    };
+    VideoFrame {
+        width: 128,
+        height: 64,
+        data: PixelData::Yuv16 {
+            planes: [plane(128, 200, 4), plane(64, 480, 0), plane(64, 480, 0)],
+            chroma: filmcraft_frame::Chroma::C422,
+            bits: 10,
+            alpha: None,
+        },
+        color: Default::default(),
+        par: (1, 1),
+        pts: Tick::ZERO,
+    }
+}
+
+#[test]
+fn lite_preserves_exact_paths_and_reduced_yuv_quality() {
+    let (mut p, red, ocean, seq, mut map) = setup();
+    place(&mut p, seq, 0, red, 0, 48);
+    for item in [red, seq] {
+        for scale in [1.0, 0.5, 0.25] {
+            let exact = render_item(&p, item, Tick::ZERO, scale, &map).unwrap();
+            let lite = render_item_lite(&p, item, Tick::ZERO, scale, &map).unwrap();
+            assert_eq!((exact.w, exact.h), (lite.w, lite.h));
+            assert_eq!(exact.px.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), lite.px.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+    }
+    let mut info = map.source(ocean).unwrap().info().clone();
+    let video = info.video.as_mut().unwrap();
+    video.width = 128;
+    video.height = 64;
+    map.0.insert(ocean, Arc::new(LiteFrameSource { info, frame: Arc::new(lite_yuv_frame()) }));
+    for scale in [1.0, 0.5, 0.25] {
+        let exact = render_item(&p, ocean, Tick::ZERO, scale, &map).unwrap();
+        let lite = render_item_lite(&p, ocean, Tick::ZERO, scale, &map).unwrap();
+        assert_eq!((exact.w, exact.h), (lite.w, lite.h));
+        if scale == 1.0 {
+            assert_eq!(exact.px.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), lite.px.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+        let a = exact.over_black_with_alpha_rgba8();
+        let b = lite.over_black_with_alpha_rgba8();
+        let squared: f64 = a
+            .chunks_exact(4)
+            .zip(b.chunks_exact(4))
+            .flat_map(|(a, b)| (0..3).map(move |i| (f64::from(a[i]) - f64::from(b[i])).powi(2)))
+            .sum();
+        let mse = squared / (exact.w * exact.h * 3) as f64;
+        let psnr = 10.0 * (255.0f64.powi(2) / mse).log10();
+        // Expect at least 38 dB: smooth gradients and small fixed-seed noise keep
+        // transfer-curve averaging error and reduced chroma differences small.
+        assert!(psnr >= 38.0, "scale {scale}: {psnr} dB");
+    }
+}

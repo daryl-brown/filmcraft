@@ -709,6 +709,15 @@ pub(crate) fn decimation(have_w: f32, target_w: f32) -> usize {
 
 /// Render a single project item (e.g. for the Source monitor) at media time `t`.
 pub fn render_item(project: &Project, item: ItemId, t: Tick, scale: f32, sources: &dyn SourceProvider) -> Option<Image> {
+    render_item_inner(project, item, t, scale, sources, false)
+}
+
+/// Render a source item with colour conversion after planar reduction for playback.
+pub fn render_item_lite(project: &Project, item: ItemId, t: Tick, scale: f32, sources: &dyn SourceProvider) -> Option<Image> {
+    render_item_inner(project, item, t, scale, sources, true)
+}
+
+fn render_item_inner(project: &Project, item: ItemId, t: Tick, scale: f32, sources: &dyn SourceProvider, lite: bool) -> Option<Image> {
     let pi = project.item(item)?;
     match &pi.kind {
         ItemKind::Sequence(s) => Some(render_seq(project, s, t, RenderOptions { scale, ..Default::default() }, sources)),
@@ -717,6 +726,12 @@ pub fn render_item(project: &Project, item: ItemId, t: Tick, scale: f32, sources
             let f = src.video_frame(FrameRequest { time: t, scale }).ok()?;
             let full_w = src.info().video.as_ref().map_or(f.width, |v| v.width) as f32;
             let n = decimation(f.width as f32, full_w * scale);
+            if lite
+                && n >= 2
+                && let Some(small) = f.box_decimated(n)
+            {
+                return Some(colorman::decode(project, item, &small, 1, &filmcraft_color::ColorPipeline::REC709));
+            }
             // the Source monitor shows media as SDR Rec. 709 (log/HDR tone mapped per its colour space)
             Some(colorman::decode(project, item, &f, n, &filmcraft_color::ColorPipeline::REC709))
         }

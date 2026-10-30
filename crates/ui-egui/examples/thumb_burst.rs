@@ -67,7 +67,7 @@ fn main() {
             }
             h.finish()
         };
-        let key = FrameKey { target: Target::Item(id), frame: 0, size: 160, revision: rev, draft: false };
+        let key = FrameKey { target: Target::Item(id), frame: 0, size: 160, revision: rev, draft: false, lite: false };
         server.request(key, rate.tick_of(0), 160.0 / width.max(1) as f32, &s.project.clone(), 50);
         keys.push(key);
     }

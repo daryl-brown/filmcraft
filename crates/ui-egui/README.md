@@ -132,3 +132,9 @@ Normal frame polling drains outcomes once and places the imported items at that 
 `timeline_drop_ui::gated_timeline_drop_places_the_outcome_at_the_saved_pointer` covers a
 blocked open and pointer movement during the wait. The existing drop tests wait through
 normal frame polling. These tests require execution with a Rust toolchain to verify them.
+
+Source monitor playback at half resolution or lower requests lighter colour conversion.
+`FrameKey::lite` separates these frames from exact paused, stepped and thumbnail requests.
+An existing texture can remain visible while the exact paused result arrives, retaining
+its original key. Program requests keep exact colour conversion. Truth-table and cache
+separation tests were added; execution is unverified without a Rust toolchain.

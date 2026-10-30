@@ -25,6 +25,26 @@ pub enum Which {
     Program,
 }
 
+fn source_playback_lite(which: Which, playing: bool, scale: f32) -> bool {
+    which == Which::Source && playing && scale <= 0.5
+}
+
+#[cfg(test)]
+mod lite_tests {
+    use super::{Which, source_playback_lite};
+
+    #[test]
+    fn source_playback_lite_truth_table() {
+        for which in [Which::Source, Which::Program] {
+            for playing in [false, true] {
+                for scale in [1.0, 0.75, 0.5, 0.25] {
+                    assert_eq!(source_playback_lite(which, playing, scale), which == Which::Source && playing && scale <= 0.5);
+                }
+            }
+        }
+    }
+}
+
 /// What the monitor's picture block draws this frame.
 struct PictureCtx {
     target: Target,
@@ -79,7 +99,7 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
     };
     // Draft decoding (opt-in): only while playing at 1/2 resolution or lower.
     let draft = crate::frames::draft_playback(playing, scale, app.session.prefs.playback.draft_decode);
-    let key = FrameKey { target, frame, size: size_key, revision: rev, draft };
+    let key = FrameKey { target, frame, size: size_key, revision: rev, draft, lite: source_playback_lite(which, playing, scale) };
     let project = app.session.project.clone();
     if playing {
         let clock = if which == Which::Program { &app.playback } else { &app.source_playback.clock };
@@ -144,7 +164,7 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
             Target::Sequence(s) if mv.transparency_grid => Target::SequenceLive(s),
             t => t,
         };
-        let rkey = FrameKey { target: rtarget, frame: rf, size: size_key, revision: rev, draft: false };
+        let rkey = FrameKey { target: rtarget, frame: rf, size: size_key, revision: rev, draft: false, lite: false };
         app.frames.request(rkey, rate.tick_of(rf), scale, &project, 1);
         let rpic = fit(ra, display_w, frame_size.1 as f32);
         if mv.transparency_grid {
@@ -655,7 +675,7 @@ fn eyedropper(app: &mut FilmcraftApp, ui: &mut egui::Ui, resp: &egui::Response, 
         let frame = rate.frame_at(time);
         // a revision of its own, so this render never replaces what the monitor caches
         let revision = app.session.revision ^ 0x5eed_d70b_0000_0000 ^ armed.clip.rotate_left(17) ^ armed.effect as u64;
-        let key = FrameKey { target, frame, size: (EYEDROPPER_SCALE * 1000.0) as u32, revision, draft: false };
+        let key = FrameKey { target, frame, size: (EYEDROPPER_SCALE * 1000.0) as u32, revision, draft: false, lite: false };
         ctx.data_mut(|d| d.insert_temp(pending_id, EyedropperPick { uv, key, time: rate.tick_of(frame), project: std::sync::Arc::new(project) }));
     }
     let Some(pick) = ctx.data(|d| d.get_temp::<EyedropperPick>(pending_id)) else { return };
